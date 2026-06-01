@@ -1,8 +1,10 @@
 
 
 from chatkit.server import StreamingResult
+from pathlib import Path
 from fastapi import FastAPI, Request
 from fastapi.responses import Response, StreamingResponse
+from fastapi.staticfiles import StaticFiles
 from starlette.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -10,6 +12,8 @@ from app.data_store import USER_ID_KEY, MyDataStore
 from app.chatkit_server import MyChatKitServer
 
 app = FastAPI()
+APP_DIR = Path(__file__).resolve().parent
+app.mount("/static", StaticFiles(directory=str(APP_DIR)), name="static")
 
 # Add CORS to allow our server to be called from local front-end
 app.add_middleware(

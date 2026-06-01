@@ -24,7 +24,8 @@ function ChatKitComponent({
 }: ChatKitComponentProps) {
   const [error, setError] = useState<string | null>(null)
   const [mapState, setMapState] = useState<MapState>(null)
-  const [plotHtml, setPlotHtml] = useState<string | null>(null) // 👈 NEW: HTML for Plotly chart
+  const [plotHtml, setPlotHtml] = useState<string | null>(null) // plot HTML
+  const [pdfUrl, setPdfUrl] = useState<string | null>(null)
 
   // --- script availability effect (unchanged) ---
   useEffect(() => {
@@ -202,13 +203,35 @@ function ChatKitComponent({
         }
 
         if (action.type === "report.open") {
+          const url = String(action.payload?.url ?? "")
+          if (url) {
+            setPdfUrl(url)
+            setPlotHtml(null)
+            setMapState(null)
+            return
+          }
           const html = String(action.payload?.html ?? "")
           if (html) {
             const responsiveHtml = makePlotlyResponsive(html)
             setPlotHtml(responsiveHtml)
+            setPdfUrl(null)
           }
           return
         }
+
+        if (action.type === "radar.click") {
+          const html = String(action.payload?.html ?? "")
+          if (html) {
+            setPlotHtml(makePlotlyResponsive(html))
+          } else {
+            console.warn("radar.click payload.html is empty")
+          }
+          return
+        }
+
+
+
+
       },
     },
 
@@ -248,7 +271,8 @@ function ChatKitComponent({
 
   const hasMap = !!mapUrl
   const hasPlot = !!plotHtml
-  const showRightPane = hasMap || hasPlot
+  const hasPdf = !!pdfUrl
+  const showRightPane = hasMap || hasPlot || hasPdf
 
 return (
   <div
@@ -266,6 +290,7 @@ return (
           {/* Header */}
           <div className="shrink-0 flex items-center justify-between px-2 py-1 text-xs text-slate-600 dark:text-slate-300">
             <span>
+              {hasPdf && "PDF source"}
               {hasPlot && "Plotly chart"}
               {!hasPlot && hasMap && mapState && (
                 <>
@@ -291,6 +316,7 @@ return (
               onClick={() => {
                 setMapState(null)
                 setPlotHtml(null)
+                setPdfUrl(null)
               }}
             >
               <span className="text-[13px] leading-none">×</span>
@@ -300,7 +326,13 @@ return (
 
           {/* Content: fills remaining height */}
           <div className="flex-1 min-h-0">
-            {hasPlot ? (
+            {hasPdf ? (
+              <iframe
+                title="PDF source"
+                src={pdfUrl ?? ""}
+                className="h-full w-full border-0 bg-white"
+              />
+            ) : hasPlot ? (
               <iframe
                 title="Plotly chart"
                 srcDoc={plotHtml ?? ""}

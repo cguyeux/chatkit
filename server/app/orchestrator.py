@@ -1,487 +1,776 @@
-# orchestrator.py
-
+# app/orchestrator.py
 from __future__ import annotations
-from dataclasses import dataclass
+
+import os
 import json
-from typing import Any, Dict, List
+import re
+from urllib.parse import quote
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Optional, Tuple
 
-# OpenAI Agents SDK
-from agents import Agent, Runner, FileSearchTool, ModelSettings, StopAtTools
-from openai.types.shared.reasoning import Reasoning
-# ChatKit context type
+from agents import Agent, Runner, FileSearchTool, ModelSettings
 from chatkit.agents import AgentContext
-from contextlib import AsyncExitStack
-from agents.mcp import MCPServerStreamableHttp
-
+from app.viz.radar_html import build_radar_dashboard_html
 
 # =====================================================
 # CONFIG
-# =====================================================
+# ===================================================== VECTOR_STORE_ID vs_6a1d49343a688191a1a714ca3dafc3d8  
+VECTOR_STORE_ID = os.getenv("VECTOR_STORE_ID", "vs_6a116b3869e08191aa26f247b322a8c1")
+KC_GRAPH_PATH = os.getenv("KC_GRAPH_PATH", os.path.join(os.path.dirname(__file__), "kc_graph1.json"))
 
-VECTOR_STORE_ID = "vs_692857ec28d8819194c4952fcb7f4687"
-# 🔐 Agents SDK uses OPENAI_API_KEY from env, so no need for OpenAI() client here.
+DIAGNOSTIC_Q_NUM = int(os.getenv("DIAGNOSTIC_Q_NUM", "8"))# global diagnostic length
+"""   
+PRACTICE_Q_NUM = int(os.getenv("PRACTICE_Q_NUM", "3"))       # per-KC practice length""" 
+THRESHOLD = float(os.getenv("MASTERY_THRESHOLD", "0.7"))     # pass threshold (0..1)
 
-
-# =====================================================
-# ROUTER AGENT (Agent[AgentContext] – intent classifier)
-# =====================================================
-
-class RouterAgent:
-    def __init__(self) -> None:
-        self.agent: Agent[AgentContext] = Agent[AgentContext](
-            name="RouterAgent",
-            model="gpt-4.1",
-           instructions=(
-            "You are an intent classifier for a firefighter assistant.\n\n"
-            "Return EXACTLY one of the following tokens (no extra text):\n"
-            "- DOCTRINE_QUERY\n"
-            "- QUIZ_REQUEST\n"
-            "- STUDY_CARD_REQUEST\n"
-            "- SCHEMA_REQUEST\n"
-            "- MAP_REQUEST\n"
-            "- PLOTLY_REQUEST\n"
-            "- EVALUATION_REQUEST\n\n"
-            "EVALUATION_REQUEST is for answers like: 1B 2C 3C ...\n"
-            "Use STUDY_CARD_REQUEST whenever the user asks for a course, lesson plan, "
-            "or study card to be generated.\n"
-            "Use SCHEMA_REQUEST for requests about incident schematics, operational layouts, "
-            "or drawing tactical plans.\n"
-            "Use MAP_REQUEST whenever the user asks for a map, localisation, GPS point, "
-            "OpenStreetMap link, coordinates, or wants to see a map preview.\n"
-            "Use PLOTLY_REQUEST when the user asks to build, draw, or update a graph/chart/plot "
-            "using data or wants a visual representation (bar chart, line chart, etc.)."
-        ),
-            model_settings=ModelSettings(
-                store=True,
-                # reasoning=Reasoning(effort="medium")
-            )
-        )
-
-
-    async def classify(self, text: str, ctx: AgentContext) -> str:
-        """Classify intent: doctrine, quiz, evaluation."""
-        print("[RouterAgent] text:", text)
-        result = await Runner.run(self.agent, text, context=ctx)
-        intent = (result.final_output or "").strip()
-        return intent
-
+PRACTICE_MIN_Q = int(os.getenv("PRACTICE_MIN_Q", "3"))
+PRACTICE_MAX_Q = int(os.getenv("PRACTICE_MAX_Q", "10"))
+MODULE_THRESHOLD = float(os.getenv("MODULE_THRESHOLD", "0.7"))
+MODULE_MIN_Q = int(os.getenv("MODULE_MIN_Q", "8"))
+MODULE_MAX_Q = int(os.getenv("MODULE_MAX_Q", "20"))
 
 # =====================================================
-# DOCTRINE AGENT (Agent[AgentContext] + FileSearchTool)
+# HELPERS (extract latest user message text)
 # =====================================================
-
-
-
-class PlotlyMCPAgent:
+def extract_latest_user_text(input_items: Any) -> str:
     """
-    Agent that uses the PredictOps Plotly MCP server to build visualizations.
+    input_items is produced by ThreadItemConverter.to_agent_input(items).
+    It's typically a list of message dicts with content blocks.
     """
-
-    PLOTLY_INSTRUCTIONS = """
-Tu es un assistant de visualisation connecté à un serveur MCP « plotly ».
-Tu peux appeler les outils exposés par ce serveur pour générer des graphiques Plotly
-(2D, 3D, cartes, finance, hiérarchies, etc.).
-
-## Familles d’outils
-- **Traces 2D de base** : `create_scatter_plot`, `create_bar_chart`, `create_line_chart`,
-  `create_pie_chart`, `create_histogram`.
-- **Traces statistiques** : `create_box_plot`, `create_violin_plot`, `create_heatmap_chart`,
-  `create_contour_chart`, `create_splom_chart`, `create_parallel_coordinates`,
-  `create_parallel_categories`, `create_histogram2d_chart`.
-- **3D & volumes** : `create_scatter3d_plot`, `create_surface_plot`, `create_mesh3d_plot`,
-  `create_volume_plot`, `create_isosurface_plot`, `create_cone_plot`, `create_streamtube_plot`.
-- **Cartographie** : `create_choropleth_map`, `create_choroplethmap`,
-  `create_choropleth_mapbox`, `create_scatter_geo_plot`, `create_scatter_map`,
-  `create_scatter_mapbox_plot`, `create_density_map`, `create_density_mapbox`.
-- **Finance et hiérarchies** : `create_candlestick_chart`, `create_ohlc_chart`,
-  `create_waterfall_chart`, `create_treemap_chart`, `create_sunburst_chart`,
-  `create_icicle_chart`, `create_sankey_diagram`.
-- **Utilitaires** : `generate_sample_data`, `create_multi_trace_figure`, `server_status`, `stop_server`.
-
-TON COMPORTEMENT :
-
-1. À partir de la question de l’utilisateur, choisis toi-même l’outil le plus adapté
-   parmi ceux ci-dessus et appelle-le via le serveur MCP.
-
-2. Tu laisses le serveur MCP décider du contenu de la réponse :
-   logs, chemins de fichiers, « HTML Content: <html>...</html> », etc.
-
-3. **Tu ne modifies RIEN** dans la sortie de l’outil :
-   
-4. Ta réponse finale à l’utilisateur doit être **strictement** la sortie brute renvoyée
-   par l’outil MCP (comme dans l’intercepteur MCP), caractère pour caractère.
-"""
+    if isinstance(input_items, list):
+        for msg in reversed(input_items):
+            if not isinstance(msg, dict):
+                continue
+            if msg.get("role") != "user":
+                continue
+            blocks = msg.get("content", [])
+            if not isinstance(blocks, list):
+                continue
+            for b in blocks:
+                if isinstance(b, dict) and b.get("type") == "input_text":
+                    t = (b.get("text") or "").strip()
+                    if t:
+                        return t
+    return str(input_items or "").strip()
 
 
-    def __init__(self) -> None:
-        # Async context stack to manage the MCP server lifetime
-        self._stack: AsyncExitStack | None = None
-        self._agent: Agent[AgentContext] | None = None
-        self._initialized: bool = False
-
-    async def _ensure_agent(self) -> None:
-        if self._initialized:
-            return
-
-        if self._stack is None:
-            self._stack = AsyncExitStack()
-
-        # Create ONE MCP server instance pointing to PredictOps Plotly MCP
-        mcp_server = await self._stack.enter_async_context(
-            MCPServerStreamableHttp(
-                name="PredictOps Plotly MCP",
-                params={
-                    "url": "https://predictops-chat.duckdns.org/predictops-mcp/plotly/mcp",
-                    "timeout": 30,
-                },
-                cache_tools_list=True,
-                max_retry_attempts=4,
-                client_session_timeout_seconds=60,
-            )
-        )
-
-        # Create the LLM agent that uses this MCP server
-        self._agent = Agent[AgentContext](
-            name="PlotlyAgent",
-            model="gpt-4.1",
-            instructions=self.PLOTLY_INSTRUCTIONS,
-            mcp_servers=[mcp_server],
-            model_settings=ModelSettings(tool_choice="required"),
-        )
-
-        self._initialized = True
-
-    async def build_chart(self, question: str, ctx: AgentContext) -> str:
-        """
-        Ask the Plotly MCP agent to build or explain a chart.
-        """
-        await self._ensure_agent()
-        assert self._agent is not None
-
-        result = await Runner.run(self._agent, question, context=ctx)
-        print("result::",result)
-        return (result.final_output or "").strip()
-
-    async def aclose(self) -> None:
-        """
-        Optional: to be called when shutting down the app/server.
-        """
-        if self._stack is not None:
-            await self._stack.aclose()
-            self._stack = None
-            self._initialized = False
+def looks_like_answers(text: str) -> bool:
+    # matches: 1A 2C 3B or 1 a,2 c ...
+    return bool(re.search(r"\b\d+\s*[A-D]\b", text.upper()))
 
 
+def parse_answers_from_text(text: str) -> Dict[int, str]:
+    out: Dict[int, str] = {}
+    s = text.upper().replace(",", " ")
+    for m in re.finditer(r"\b(\d+)\s*([A-D])\b", s):
+        out[int(m.group(1))] = m.group(2)
+    return out
 
 
+def qcm_widget_data(title: str, questions: List[dict]) -> Dict[str, Any]:
+    """
+    Builds the dict expected by your qcm widget builder:
+    { "title": "...", "questions": [ {id,prompt,choices:[{label,value}]} ] }
+    """
+    q_out: List[dict] = []
+    for q in questions:
+        # q["choices"] must be list[str] length 4
+        c = q["choices"]
+        q_out.append({
+            "id": str(q["number"]),
+            "prompt": q["text"],
+            "choices": [
+                {"label": f"A) {c[0]}", "value": "A"},
+                {"label": f"B) {c[1]}", "value": "B"},
+                {"label": f"C) {c[2]}", "value": "C"},
+                {"label": f"D) {c[3]}", "value": "D"},
+            ],
+        })
+    return {"title": title, "questions": q_out}
 
 
-class DoctrineAgent:
-    async def answer(self, query: str, ctx: AgentContext) -> str:
-        """
-        Answer doctrine questions using the vector store via FileSearchTool.
-
-        ctx: AgentContext from chatkit.agents
-          - ctx.thread
-          - ctx.store
-          - ctx.request_context
-        """
-
-        # ------------------------------
-        # 1) Logging / Context info
-        # ------------------------------
-        thread_id = getattr(ctx.thread, "id", "unknown-thread")
-        print(f"[DoctrineAgent] thread={thread_id} | query={query!r}")
-
-        # ------------------------------
-        # 2) Dynamic vector store via context
-        # ------------------------------
-        vector_store_id = VECTOR_STORE_ID
-        rc = getattr(ctx, "request_context", None)
-
-        if isinstance(rc, dict):
-            vector_store_id = rc.get("vector_store_id", VECTOR_STORE_ID)
-
-        # Optional: adapt system prompt with profile / role
-        system_prompt = (
-            "You are a doctrine assistant for firefighters.\n"
-            "Use ONLY the content provided by the doctrine files in the vector store.\n"
-            "If doctrine data is missing, say so explicitly."
-        )
-        if isinstance(rc, dict) and rc.get("profile"):
-            system_prompt += f"\nUser profile: {rc['profile']}."
-
-        # ------------------------------
-        # 3) Build a per-call Agent with FileSearchTool
-        #    (vector_store_id can change per request)
-        # ------------------------------
-        file_search_tool = FileSearchTool(
-            max_num_results=8,
-            vector_store_ids=[vector_store_id],
-        )
-
-        doctrine_agent: Agent[AgentContext] = Agent[AgentContext](
-            name="DoctrineAgent",
-            model="gpt-4.1",
-            instructions=system_prompt,
-            tools=[file_search_tool],
-        )
-
-        # The Agents SDK will automatically:
-        #  - decide if/when to call file_search
-        #  - run the tool
-        #  - feed results back to the model
-        result = await Runner.run(doctrine_agent, query, context=ctx)
-
-        return (result.final_output or "").strip()
-    
-class SchemaAgent:
-    async def build_schema(self, query: str, ctx: AgentContext) -> str:
-        """
-        Build a fictitious operational schematic description
-        using doctrinal conventions: zones, actions, moyens,
-        commandement, flux, symboles, positions, sectorisation…
-
-        ctx gives access to thread, store, request_context.
-        """
-
-        thread_id = getattr(ctx.thread, "id", "unknown-thread")
-        print(f"[SchemaAgent] thread={thread_id} | query={query!r}")
-
-        # Dynamic vector store if provided
-        vector_store_id = VECTOR_STORE_ID
-        rc = getattr(ctx, "request_context", None)
-
-        if isinstance(rc, dict):
-            vector_store_id = rc.get("vector_store_id", VECTOR_STORE_ID)
-
-        # You control the style and conventions here
-        system_prompt = (
-            "You are an operational schematic assistant for firefighters.\n"
-            "Your output is a structured schematic plan based on doctrine.\n"
-            "You ALWAYS explain how to draw the schematic (paper or digital).\n"
-            "Your answers MUST follow this structure:\n"
-            "\n"
-            "1) Contexte général du sinistre (lieu, risques, zones sensibles)\n"
-            "2) Représentation graphique (formes, positions, symboles doctrinaux)\n"
-            "3) Actions codifiées (R-x, A-x, D-x)\n"
-            "4) Moyens engagés (dessinable, positions)\n"
-            "5) Organisation opérationnelle (PC, circulation, secteurs)\n"
-            "\n"
-            "The answer must be procedural: step-by-step instructions to reproduce the scheme.\n"
-            "If doctrine content is missing from the vector store, state it clearly."
-        )
-
-        # Optional personalization
-        if isinstance(rc, dict) and rc.get("profile"):
-            system_prompt += f"\nUser profile: {rc['profile']}."
-
-        # File search tool (same logic as doctrine agent)
-        file_search_tool = FileSearchTool(
-            max_num_results=8,
-            vector_store_ids=[vector_store_id],
-        )
-
-        schema_agent: Agent[AgentContext] = Agent[AgentContext](
-            name="SchemaAgent",
-            model="gpt-4.1",
-            instructions=system_prompt,
-            tools=[file_search_tool],
-        )
-
-        result = await Runner.run(schema_agent, query, context=ctx)
-
-        return (result.final_output or "").strip()
 
 
 # =====================================================
-# STUDY AGENT (Agent[AgentContext] + FileSearchTool)
+# KC GRAPH LOADER  (FIXED: leaf KCs + outline order)
 # =====================================================
+@dataclass
+class KCNode:
+    id: str
+    title: str
+    kind: str
+    outline_path: List[str] = field(default_factory=list)
+    pages: List[int] = field(default_factory=list)
 
-class StudyAgent:
-    """
-    Generates structured study card payloads that match the study.widget schema.
-    """
 
-    STUDY_SCHEMA_EXAMPLE = (
-        '{"payload":{"title":"string","sections":[{"label":"string","content":"string",'
-        '"bullets":["string"],"questions":[{"id":"string","question":"string","choices":'
-        '["string","string","string","string"],"correct":"string"}]}],"next_steps":["string"]}}'
-    )
+@dataclass
+class KcGraph:
+    title: str
+    nodes: Dict[str, KCNode]
+    source_pdf: str = ""
 
-    def __init__(self) -> None:
-        self.instructions = (
-            "You are a firefighter doctrine course designer. Build concise study cards "
-            "strictly from the doctrine materials available via the file_search tool.\n"
-            "Output MUST be valid JSON (no markdown, no prose) that matches this schema:\n"
-            f"{self.STUDY_SCHEMA_EXAMPLE}\n"
-            "- Always populate payload.title with an informative course name.\n"
-            "- Provide 3-4 sections when possible; each section must have a label and at "
-            "least one of: content, bullets, or questions.\n"
-            "- When adding questions, include 2-4 multiple-choice options and specify the "
-            "correct answer text in the 'correct' field.\n"
-            "- next_steps should contain actionable follow-ups or drills.\n"
-            "If doctrine content is missing, explain that limitation in the content fields "
-            "but still return valid JSON."
-        )
+    # raw edges
+    next_by_id: Dict[str, str] = field(default_factory=dict)          # sequence edges
+    children_by_id: Dict[str, List[str]] = field(default_factory=dict)  # contains edges
+    parent_by_id: Dict[str, str] = field(default_factory=dict)
 
-    async def create_course(self, request_text: Any, ctx: AgentContext) -> Dict[str, Any]:
-        # Normalize request_text safely, supporting list, dict, and chatkit-style messages
-        topic_text = ""
+    # computed teaching order
+    ordered_kc_ids: List[str] = field(default_factory=list)
+    index_by_kc: Dict[str, int] = field(default_factory=dict)
 
-        # Case 1: If request_text is already a simple string
-        if isinstance(request_text, str):
-            topic_text = request_text.strip()
-
-        # Case 2: If request_text is list (ChatKit message list)
-        elif isinstance(request_text, list):
-            for msg in reversed(request_text):
-                if not isinstance(msg, dict):
-                    continue
-                if msg.get("role") != "user":
-                    continue
-                blocks = msg.get("content", [])
-                if not isinstance(blocks, list):
-                    continue
-                for block in blocks:
-                    if isinstance(block, dict) and block.get("type") == "input_text":
-                        extracted = (block.get("text") or "").strip()
-                        if extracted:
-                            topic_text = extracted
-                            break
-                if topic_text:
-                    break
-
-        # Case 3: Fallback for weird types (numbers, dict, None, etc.)
-        else:
-            topic_text = str(request_text).strip()
-
-        # Ensure topic is non-empty
-        topic = topic_text or "Firefighter doctrine overview"
-
-        # -------------------------
-        # Continue original logic
-        # -------------------------
-        rc = getattr(ctx, "request_context", None)
-        vector_store_id = VECTOR_STORE_ID
-        if isinstance(rc, dict):
-            vector_store_id = rc.get("vector_store_id", VECTOR_STORE_ID)
-
-        file_search_tool = FileSearchTool(
-            max_num_results=8,
-            vector_store_ids=[vector_store_id],
-        )
-
-        agent = Agent[AgentContext](
-            name="StudyAgent",
-            model="gpt-4.1",
-            instructions=self.instructions,
-            tools=[file_search_tool],
-        )
-
-        user_prompt = f"""
-    Build a structured firefighter study card for the following learner request.
-    Focus strictly on verified doctrine from the files and include actionable teaching points.
-
-    Learner request:
-    \"\"\"{topic}\"\"\"\n
-    Return ONLY the JSON payload that matches the schema described in your instructions.
-    """
-
-        result = await Runner.run(agent, user_prompt, context=ctx)
-        raw = (result.final_output or "").strip()
-
+    @staticmethod
+    def load(path: str) -> "KcGraph":
+        with open(path, "r", encoding="utf-8") as f:
+            raw = f.read()
         try:
             data = json.loads(raw)
-        except json.JSONDecodeError as exc:
-            print("[StudyAgent] JSON decode error:", exc, raw)
-            data = {}
+        except json.JSONDecodeError:
+            # Tolerate common hand-edited JSON issue: trailing commas before ] or }.
+            cleaned = re.sub(r",(\s*[\]}])", r"\1", raw)
+            data = json.loads(cleaned)
 
-        normalized = normalize_study_widget_payload(data if isinstance(data, dict) else {})
-        return normalized
+        # ---- nodes
+        nodes: Dict[str, KCNode] = {}
+        for n in data.get("nodes", []):
+            if not isinstance(n, dict):
+                continue
+            nid = str(n.get("id") or "").strip()
+            if not nid:
+                continue
+            nodes[nid] = KCNode(
+                id=nid,
+                title=str(n.get("title") or "").strip(),
+                kind=str(n.get("kind") or "").strip(),
+                outline_path=n.get("outline_path") or [],
+                pages=[int(p) for p in (n.get("pages") or []) if isinstance(p, int)],
+            )
+
+        # ---- edges: sequence + contains
+        # Supports both:
+        # 1) legacy: data["edges"] = [{"type":"contains|sequence","src":"...","dst":"..."}]
+        # 2) new form: data["contains"] = [[src,dst], ...], data["sequence"] = [[src,dst], ...]
+        next_by_id: Dict[str, str] = {}
+        children_by_id: Dict[str, List[str]] = {}
+        parent_by_id: Dict[str, str] = {}
+
+        def add_contains(src: str, dst: str) -> None:
+            if not src or not dst:
+                return
+            children_by_id.setdefault(src, []).append(dst)
+            # assume single parent (outline tree)
+            if dst not in parent_by_id:
+                parent_by_id[dst] = src
+
+        def add_sequence(src: str, dst: str) -> None:
+            if not src or not dst:
+                return
+            next_by_id[src] = dst
+
+        for e in data.get("edges", []):
+            if not isinstance(e, dict):
+                continue
+            et = str(e.get("type") or "").strip().lower()
+            src = str(e.get("src") or "").strip()
+            dst = str(e.get("dst") or "").strip()
+            if et == "sequence":
+                add_sequence(src, dst)
+            elif et == "contains":
+                add_contains(src, dst)
+
+        for pair in data.get("contains", []):
+            if not isinstance(pair, list) or len(pair) < 2:
+                continue
+            add_contains(str(pair[0] or "").strip(), str(pair[1] or "").strip())
+
+        for pair in data.get("sequence", []):
+            if not isinstance(pair, list) or len(pair) < 2:
+                continue
+            add_sequence(str(pair[0] or "").strip(), str(pair[1] or "").strip())
+
+        g = KcGraph(
+            title=str(data.get("title") or data.get("source_title") or "Course").strip(),
+            nodes=nodes,
+            source_pdf=str(data.get("source_pdf") or "").strip(),
+            next_by_id=next_by_id,
+            children_by_id=children_by_id,
+            parent_by_id=parent_by_id,
+        )
+
+        # ---- compute ordered leaf-KCs in outline order
+        g.ordered_kc_ids = g._compute_ordered_teachable_kcs()
+        g.index_by_kc = {kc_id: i for i, kc_id in enumerate(g.ordered_kc_ids)}
+        return g
+
+    # --------------------------
+    # Teaching selection: ONLY leaf KCs (no KC/module children)
+    # --------------------------
+    def _is_teachable_kc(self, nid: str) -> bool:
+        n = self.nodes.get(nid)
+        return bool(n and n.kind.lower() == "kc")
 
 
+    # --------------------------
+    # Order children using sequence edges when possible
+    # --------------------------
+    def _ordered_children(self, parent_id: str) -> List[str]:
+        kids = [k for k in self.children_by_id.get(parent_id, []) if k in self.nodes]
+        if not kids:
+            return []
+
+        kidset = set(kids)
+
+        # collect sequence links restricted to this sibling set
+        nxt = {k: self.next_by_id[k] for k in kids if self.next_by_id.get(k) in kidset}
+        pointed_to = set(nxt.values())
+
+        # start nodes = those not pointed to by others
+        starters = [k for k in kids if k not in pointed_to]
+
+        ordered: List[str] = []
+        visited: set[str] = set()
+
+        def follow_chain(start: str):
+            cur = start
+            while cur and cur not in visited:
+                visited.add(cur)
+                ordered.append(cur)
+                cur = nxt.get(cur)
+
+        # follow chains from starters first
+        for s in starters:
+            follow_chain(s)
+
+        # append any remaining (in original order)
+        for k in kids:
+            if k not in visited:
+                follow_chain(k)
+
+        return ordered
+
+    # --------------------------
+    # Compute an outline-ordered list of leaf KCs
+    # --------------------------
+    def _compute_ordered_teachable_kcs(self) -> List[str]:
+        # pick a root: course node if exists, else any node without a parent
+        root = None
+        for nid, n in self.nodes.items():
+            if n.kind.lower() == "course":
+                root = nid
+                break
+        if not root:
+            roots = [nid for nid in self.nodes if nid not in self.parent_by_id]
+            root = roots[0] if roots else None
+
+        if not root:
+            # fallback: all teachable KCs (unordered)
+            return [nid for nid in self.nodes if self._is_teachable_kc(nid)]
+
+        out: List[str] = []
+        seen: set[str] = set()
+
+        def dfs(node_id: str):
+            # ✅ PRE-ORDER: teach the KC first
+            if self._is_teachable_kc(node_id) and node_id not in seen:
+                seen.add(node_id)
+                out.append(node_id)
+
+            # then traverse children in outline order
+            for child in self._ordered_children(node_id):
+                dfs(child)
+
+        dfs(root)
+        return out
+
+
+    # --------------------------
+    # Public API used by Orchestrator
+    # --------------------------
+    def kc_ids(self) -> List[str]:
+        # ONLY teachable leaf KCs, already ordered
+        return list(self.ordered_kc_ids)
+
+    def next_kc(self, kc_id: str) -> Optional[str]:
+        i = self.index_by_kc.get(kc_id)
+        if i is None:
+            return None
+        j = i + 1
+        if j < len(self.ordered_kc_ids):
+            return self.ordered_kc_ids[j]
+        return None
+    def module_of(self, nid: str) -> Optional[str]:
+        """Return the module id that contains this node (KC), using parent_by_id."""
+        cur = nid
+        while True:
+            p = self.parent_by_id.get(cur)
+            if not p:
+                return None
+            pn = self.nodes.get(p)
+            if pn and pn.kind.lower() == "module":
+                return p
+            cur = p
+
+
+    def module_kcs(self, module_id: str) -> List[str]:
+        """Return ordered teachable KCs under a module."""
+        if module_id not in self.nodes:
+            return []
+
+        out: List[str] = []
+
+        def dfs(nid: str):
+            if self._is_teachable_kc(nid):
+                out.append(nid)
+            for ch in self._ordered_children(nid):
+                dfs(ch)
+
+        dfs(module_id)
+
+        # keep in global teaching order
+        out_set = set(out)
+        return [kc for kc in self.ordered_kc_ids if kc in out_set]
+
+    def module_ids(self) -> List[str]:
+        return [nid for nid, n in self.nodes.items() if n.kind.lower() == "module"]
+        # --------------------------
+    # Radar grouping: modules from outline_path (robust)
+    # --------------------------
+    def _clean_module_label(self, label: str) -> str:
+        return (label or "").strip()
+
+    def module_label_for_kc(self, kc_id: str) -> str:
+        """
+        Decide module label for a KC using outline_path.
+        Falls back to contains-based module if outline_path is missing.
+        """
+        node = self.nodes.get(kc_id)
+        if node and isinstance(node.outline_path, list) and node.outline_path:
+            path = [str(x).strip() for x in node.outline_path if str(x).strip()]
+
+            # remove course title if it appears at the beginning
+            if path and self.title and path[0].lower() == self.title.lower():
+                path = path[1:]
+
+            # module label = first remaining level
+            if path:
+                return self._clean_module_label(path[0])
+
+        # fallback: use contains-based module node title (your old logic)
+        mid = self.module_of(kc_id)
+        if mid and mid in self.nodes:
+            return self._clean_module_label(self.nodes[mid].title)
+
+        return "Module (Unknown)"
+
+    def module_groups_for_radar(self) -> Dict[str, List[str]]:
+        """
+        Returns: {module_label: [kc_id, kc_id, ...]} in global teaching order.
+        Uses outline_path to group.
+        """
+        groups: Dict[str, List[str]] = {}
+        for kc_id in self.ordered_kc_ids:
+            if not self._is_teachable_kc(kc_id):
+                continue
+            label = self.module_label_for_kc(kc_id)
+            groups.setdefault(label, []).append(kc_id)
+        return groups
+        # --------------------------
+    # Radar grouping by "section containers"
+    # A container is:
+    # - kind in {"module","layer"} OR
+    # - kind=="kc" BUT it has children (contains edges)
+    # --------------------------
+    def _is_container(self, nid: str) -> bool:
+        n = self.nodes.get(nid)
+        if not n:
+            return False
+        k = (n.kind or "").lower()
+        if k in {"module", "layer"}:
+            return True
+        if k == "kc" and self.children_by_id.get(nid):  # kc used as section header
+            return True
+        return False
+
+    def container_of(self, nid: str) -> Optional[str]:
+        """
+        Return nearest container ancestor for this node.
+        """
+        cur = nid
+        while True:
+            p = self.parent_by_id.get(cur)
+            if not p:
+                return None
+            if self._is_container(p):
+                return p
+            cur = p
+
+    def container_groups_for_radar(self) -> Dict[str, List[str]]:
+        """
+        Returns: {container_id: [kc_ids...]} in global teaching order.
+        Group each teachable KC by its nearest container.
+        """
+        groups: Dict[str, List[str]] = {}
+        for kc_id in self.ordered_kc_ids:
+            if not self._is_teachable_kc(kc_id):
+                continue
+            cid = self.container_of(kc_id) or "ROOT"
+            groups.setdefault(cid, []).append(kc_id)
+        return groups
+
+    def container_ids_in_order(self) -> List[str]:
+        """
+        Containers ordered by first KC appearance in the teaching order.
+        """
+        groups = self.container_groups_for_radar()
+        seen = set()
+        ordered = []
+        for kc_id in self.ordered_kc_ids:
+            if not self._is_teachable_kc(kc_id):
+                continue
+            cid = self.container_of(kc_id) or "ROOT"
+            if cid not in seen:
+                seen.add(cid)
+                ordered.append(cid)
+        # keep only those that exist in groups
+        return [cid for cid in ordered if cid in groups]
+
+
+
+def normalize_adaptive_practice_pack(
+    pack: Any,
+    min_q: int,
+    max_q: int,
+) -> Tuple[int, List[dict]]:
+    """
+    Ensures:
+    - n is clamped to [min_q, max_q]
+    - questions is list[dict]
+    - len(questions) == n (truncate if too many)
+    - numbers are rewritten 1..n
+    """
+    if not isinstance(pack, dict):
+        return min_q, []
+
+    n = pack.get("n_questions", min_q)
+    try:
+        n = int(n)
+    except Exception:
+        n = min_q
+
+    n = max(min_q, min(n, max_q))
+
+    questions = pack.get("questions", [])
+    if not isinstance(questions, list):
+        questions = []
+
+    # truncate
+    if len(questions) > n:
+        questions = questions[:n]
+
+    # if too short, we accept but will use len(questions)
+    if len(questions) < n:
+        n = max(min_q, len(questions))
+
+    # renumber
+    for i, q in enumerate(questions, start=1):
+        if isinstance(q, dict):
+            q["number"] = i
+
+    return n, questions
 
 # =====================================================
-# QCM AGENT (Agent[AgentContext] + FileSearchTool)
+# WORKFLOW AGENTS (exactly your diagram)
 # =====================================================
 
-@dataclass
-class QcmQuestion:
-    number: int
-    text: str
-    choices: List[str]
+class DiagnosticQcmAgent:
+    """Global Diagnostic QCM (across several KCs)."""
 
-
-@dataclass
-class QcmPayload:
-    visible: List[QcmQuestion]
-    hidden: Dict[int, str]
-
-
-class QcmAgent:
     def __init__(self) -> None:
-        file_search_tool = FileSearchTool(
-            max_num_results=5,
-            vector_store_ids=[VECTOR_STORE_ID],
-        )
-
+        self.tool = FileSearchTool(max_num_results=6, vector_store_ids=[VECTOR_STORE_ID])
         self.agent: Agent[AgentContext] = Agent[AgentContext](
-            name="QcmAgent",
+            name="Diagnostic-QCM_Agent",
             model="gpt-4.1",
+            tools=[self.tool],
             instructions=(
-                "You build multiple-choice questions (QCM) strictly from doctrine files.\n"
-                "Always return ONLY the JSON list as specified in the prompt (no extra text)."
+                "You create a GLOBAL diagnostic multiple-choice quiz.\n"
+                "Use ONLY doctrine content from file_search.\n"
+                "Return ONLY valid JSON.\n"
+                "Each question MUST include:\n"
+                "- number (int)\n"
+                "- text (string)\n"
+                "- choices (array of 4 strings)\n"
+                "- answer (A/B/C/D)\n"
+                "- kc_id (string)\n"
+                "Questions must be mapped to the provided kc list."
             ),
-            tools=[file_search_tool],
+            model_settings=ModelSettings(store=True),
         )
 
-    async def generate(self, ctx: AgentContext) -> QcmPayload:
-        prompt = """
-Generate 3 QCM questions about firefighter doctrine.
-Each includes:
-- number (1..3)
-- text
-- choices [A,B,C,D]
-- answer (A/B/C/D)
+    async def generate(self, kc_list: List[KCNode], n_questions: int, ctx: AgentContext) -> List[dict]:
+        # choose subset of KCs to cover
+        # keep prompt small: send (id,title) pairs
+        kcs_payload = [{"id": k.id, "title": k.title} for k in kc_list]
 
-Return ONLY JSON, no explanation, exactly in this format:
+        prompt = f"""
+Create {n_questions} diagnostic MCQ questions that cover multiple KCs.
+Pick KCs from this list (use their ids):
+
+{kcs_payload}
+
+Rules:
+- Use file_search to ground the questions.
+- Each question references exactly one kc_id from the list.
+- choices must be 4 short options.
+- answer is one of A/B/C/D.
+
+Return ONLY JSON list:
 [
-  {"number":1,"text":"...","choices":["A..","B..","C..","D.."],"answer":"B"},
-  {"number":2,"text":"...","choices":["A..","B..","C..","D.."],"answer":"A"},
-  {"number":3,"text":"...","choices":["A..","B..","C..","D.."],"answer":"D"}
+  {{"number":1,"text":"...","choices":["..","..","..",".."],"answer":"B","kc_id":"KC_xxx"}},
+  ...
 ]
 """
-        # 👇 IMPORTANT: use result.final_output, not result directly
-        result = await Runner.run(self.agent, prompt, context=ctx)
-        raw = (result.final_output or "").strip()
-        data = json.loads(raw)
+        res = await Runner.run(self.agent, prompt, context=ctx)
+        raw = (res.final_output or "").strip()
+        return json.loads(raw)
 
-        visible: List[QcmQuestion] = []
-        hidden: Dict[int, str] = {}
 
-        for q in data:
-            visible.append(
-                QcmQuestion(
-                    number=q["number"],
-                    text=q["text"],
-                    choices=q["choices"],
-                )
-            )
-            hidden[q["number"]] = q["answer"]
+class PracticeQcmAgent:
+    """Adaptive practice QCM for one KC (LLM chooses number of questions)."""
 
-        return QcmPayload(visible=visible, hidden=hidden)
+    def __init__(self) -> None:
+        self.tool = FileSearchTool(max_num_results=8, vector_store_ids=[VECTOR_STORE_ID])
+        self.agent: Agent[AgentContext] = Agent[AgentContext](
+            name="Practice-QCM_Agent",
+            model="gpt-4.1",
+            tools=[self.tool],
+            instructions=(
+                "You create an ADAPTIVE practice quiz for ONE KC.\n"
+                "You MUST use doctrine content grounded in file_search.\n"
+                "\n"
+                "Return ONLY valid JSON with EXACTLY this shape:\n"
+                "{\n"
+                '  "n_questions": 6,\n'
+                '  "questions": [\n'
+                '    {"number":1,"text":"...","choices":["..","..","..",".."],"answer":"A"},\n'
+                "    ...\n"
+                "  ]\n"
+                "}\n"
+                "\n"
+                "Rules:\n"
+                "- n_questions must be between 3 and 10.\n"
+                "- questions length MUST equal n_questions.\n"
+                "- choices are 4 short options.\n"
+                "- answer is one of A/B/C/D.\n"
+                "- Focus on weak sub-points revealed by mistakes.\n"
+            ),
+            model_settings=ModelSettings(store=True),
+        )
+
+    async def generate_adaptive(
+        self,
+        kc: KCNode,
+        micro_lesson_text: str,
+        mistakes_summary: str,
+        ctx: AgentContext,
+    ) -> Dict[str, Any]:
+        prompt = f"""
+Build an ADAPTIVE practice QCM only about this KC:
+
+KC title: "{kc.title}"
+KC id: "{kc.id}"
+
+Micro-lesson the learner received:
+{micro_lesson_text}
+
+Learner mistakes summary (if any):
+{mistakes_summary}
+
+Return ONLY JSON:
+{{
+  "n_questions": <int 3..10>,
+  "questions": [
+    {{"number":1,"text":"...","choices":["..","..","..",".."],"answer":"B"}},
+    ...
+  ]
+}}
+"""
+        res = await Runner.run(self.agent, prompt, context=ctx)
+        raw = (res.final_output or "").strip()
+        return json.loads(raw)
+
+
+class ModuleQcmAgent:
+    """Global module checkpoint quiz (covers all KCs in one module)."""
+
+    def __init__(self) -> None:
+        self.tool = FileSearchTool(max_num_results=8, vector_store_ids=[VECTOR_STORE_ID])
+        self.agent: Agent[AgentContext] = Agent[AgentContext](
+            name="Module-QCM_Agent",
+            model="gpt-4.1",
+            tools=[self.tool],
+            instructions=(
+                "You create a MODULE checkpoint multiple-choice quiz.\n"
+                "Use ONLY doctrine content from file_search.\n"
+                "Return ONLY valid JSON.\n"
+                "Each question MUST include:\n"
+                "- number (int)\n"
+                "- text (string)\n"
+                "- choices (array of 4 strings)\n"
+                "- answer (A/B/C/D)\n"
+                "- kc_id (string)\n"
+                "Questions must be mapped to the provided kc list."
+            ),
+            model_settings=ModelSettings(store=True),
+        )
+
+    async def generate(self, module_title: str, kc_list: List[KCNode], n_questions: int, ctx: AgentContext) -> List[dict]:
+        kcs_payload = [{"id": k.id, "title": k.title} for k in kc_list]
+        prompt = f"""
+Create {n_questions} MCQ questions as a module checkpoint quiz for module: "{module_title}".
+
+KCs to cover (use their ids):
+{kcs_payload}
+
+Rules:
+- Use file_search to ground the questions.
+- Each question references exactly one kc_id from the list.
+- choices must be 4 short options.
+- answer is one of A/B/C/D.
+
+Return ONLY JSON list:
+[
+  {{"number":1,"text":"...","choices":["..","..","..",".."],"answer":"B","kc_id":"KC_xxx"}},
+  ...
+]
+"""
+        res = await Runner.run(self.agent, prompt, context=ctx)
+        raw = (res.final_output or "").strip()
+        return json.loads(raw)
+
+
+
+class MicroLessonAgent:
+    """Micro-lesson only on weakness KC (plain text, no widget, no JSON)."""
+
+    def __init__(self) -> None:
+        self.tool = FileSearchTool(max_num_results=8, vector_store_ids=[VECTOR_STORE_ID])
+        self.agent: Agent[AgentContext] = Agent[AgentContext](
+            name="Micro-lesson_Agent",
+            model="gpt-4.1",
+            tools=[self.tool],
+            instructions=(
+                "You teach a micro-lesson ONLY about the provided KC.\n"
+                "Ground everything in doctrine using file_search.\n"
+                "Return PLAIN TEXT ONLY (no JSON, no markdown code fences).\n"
+                "Use this structure:\n"
+                "1) Title\n"
+                "2) What you must know (3-16 bullets)\n"
+                "3) Operational example (short)\n"
+                "4) Common mistakes (2-4 bullets)\n"
+                "5) Quick self-check (2 short questions, no choices)\n"
+            ),
+            model_settings=ModelSettings(store=True),
+        )
+
+    async def build(self, kc: KCNode, ctx: AgentContext) -> str:
+        prompt = f"""
+Teach the learner a micro-lesson on this KC only.
+
+KC title: "{kc.title}"
+KC id: "{kc.id}"
+
+Constraints:
+- Keep it short and operational.
+- Use file_search to ground definitions/rules.
+- Plain text only.
+"""
+        res = await Runner.run(self.agent, prompt, context=ctx)
+        return (res.final_output or "").strip()
+
+
+
+
+class ExplainMistakeAgent:
+    """Explain mistakes when score below threshold."""
+
+    def __init__(self) -> None:
+        self.tool = FileSearchTool(max_num_results=8, vector_store_ids=[VECTOR_STORE_ID])
+        self.agent: Agent[AgentContext] = Agent[AgentContext](
+            name="Explain-mistake_Agent",
+            model="gpt-4.1",
+            tools=[self.tool],
+            instructions=(
+                "You explain the learner's mistakes briefly and clearly.\n"
+                "Use doctrine from file_search.\n"
+                "Output plain text (no JSON).\n"
+                "Include: what the correct concept is, why the chosen option is wrong, and 1 quick tip."
+            ),
+            model_settings=ModelSettings(store=True),
+        )
+
+    async def explain(self, kc: KCNode, wrong_items: List[dict], ctx: AgentContext) -> str:
+        prompt = f"""
+The learner struggled on this KC: "{kc.title}" ({kc.id})
+
+Here are wrong answers (each item includes question, choices, correct_letter, learner_letter):
+{wrong_items}
+
+Explain the mistakes, grounded in doctrine. Keep it concise and actionable.
+"""
+        res = await Runner.run(self.agent, prompt, context=ctx)
+        return (res.final_output or "").strip()
+
+
+class ScoreFindWeaknessAgent:
+    """Score + Find weakness (pure python)."""
+
+    def find_weakness(
+        self,
+        question_to_kc: Dict[int, str],
+        user_answers: Dict[int, str],
+        correct_answers: Dict[int, str],
+    ) -> Tuple[Optional[str], float, Dict[str, Tuple[int, int]]]:
+        """
+        Returns:
+        - weakness_kc_id
+        - overall_score (0..1)
+        - per_kc_stats: kc_id -> (correct_count, total_count)
+        """
+        total = len(correct_answers) or 1
+        correct_total = 0
+
+        per: Dict[str, Tuple[int, int]] = {}
+
+        for qnum, correct in correct_answers.items():
+            kc_id = question_to_kc.get(qnum)
+            if not kc_id:
+                continue
+            u = user_answers.get(qnum, "").upper()
+            is_ok = (u == correct.upper())
+            correct_total += 1 if is_ok else 0
+
+            c_cnt, t_cnt = per.get(kc_id, (0, 0))
+            per[kc_id] = (c_cnt + (1 if is_ok else 0), t_cnt + 1)
+
+        overall = correct_total / total
+
+        weakness = None
+        weakness_score = 2.0
+        for kc_id, (c_cnt, t_cnt) in per.items():
+            s = (c_cnt / t_cnt) if t_cnt else 1.0
+            if s < weakness_score:
+                weakness_score = s
+                weakness = kc_id
+
+        return weakness, overall, per
 
 
 # =====================================================
-# EVALUATOR AGENT (pure Python, no LLM)
+# EVALUATOR (kept for compatibility with your server)
 # =====================================================
-
 class EvaluatorAgent:
     def evaluate(self, user: Dict[int, str], correct: Dict[int, str]):
         score = 0
         details: List[str] = []
-
         for num, ans in correct.items():
             user_ans = user.get(num, "").upper()
             if user_ans == ans:
@@ -489,381 +778,721 @@ class EvaluatorAgent:
                 details.append(f"Q{num}: ✓ Correct ({user_ans})")
             else:
                 details.append(f"Q{num}: ✗ Wrong (Your: {user_ans}, Correct: {ans})")
-
-        score20 = round((score / len(correct)) * 20, 2)
+        score20 = round((score / max(1, len(correct))) * 20, 2)
         return score, score20, details
 
 
 # =====================================================
-# ORCHESTRATOR (async – all Agents via Runner)
+# SESSION STATE (per thread)
 # =====================================================
+@dataclass
+class Session:
+    phase: str = "idle"
+    scope: str = "diagnostic"
+    current_kc_id: Optional[str] = None
+
+    last_hidden_answers: Dict[int, str] = field(default_factory=dict)
+    last_question_to_kc: Dict[int, str] = field(default_factory=dict)
+    last_question_text: Dict[int, dict] = field(default_factory=dict)
+
+    mastery: Dict[str, float] = field(default_factory=dict)
+    last_score_by_kc: Dict[str, float] = field(default_factory=dict)
+
+    # ✅ Option B memory
+    current_micro_lesson: str = ""          # last generated micro-lesson for current KC
+    last_mistakes_summary: str = ""         # compact summary used to adapt practice
+    
+    # ✅ NEW: gate for "next"
+    can_advance: bool = False
+    validated_kc_id: Optional[str] = None
+    pending_next_kc_id: Optional[str] = None
+
+    current_module_id: Optional[str] = None
+
+    pending_module_id: Optional[str] = None     # module that must be validated by checkpoint
+    module_gate_locked: bool = False            # True => must pass module quiz before next
 
 
-def qcm_payload_to_widget_data(qcm: QcmPayload) -> Dict[str, Any]:
-    """
-    Convert QcmPayload → JSON-serializable dict that matches your schema:
+    module_mastery: Dict[str, float] = field(default_factory=dict)
 
-    {
-      "title": "string",
-      "questions": [
-        {
-          "id": "1",
-          "prompt": "...",
-          "choices": [
-            {"label": "A) ...", "value": "A"},
-            {"label": "B) ...", "value": "B"},
-            {"label": "C) ...", "value": "C"},
-            {"label": "D) ...", "value": "D"}
-          ]
-        },
-        ...
-      ]
-    }
-    """
-    questions: list[dict[str, Any]] = []
-
-    for q in qcm.visible:
-        questions.append(
-            {
-                "id": str(q.number),
-                "prompt": q.text,
-                "choices": [
-                    {"label": f"A) {q.choices[0]}", "value": "A"},
-                    {"label": f"B) {q.choices[1]}", "value": "B"},
-                    {"label": f"C) {q.choices[2]}", "value": "C"},
-                    {"label": f"D) {q.choices[3]}", "value": "D"},
-                ],
-            }
-        )
-
-    return {
-        "title": "QCM doctrine (3 questions)",  # or dynamic
-        "questions": questions,
-    }
-
-
-def _ensure_text(value: Any) -> str:
-    """
-    Convert arbitrary values into trimmed strings.
-    """
-    if isinstance(value, str):
-        text = value.strip()
-        if text:
-            return text
-        return ""
-    if isinstance(value, (int, float)):
-        return str(value)
-    if isinstance(value, bool):
-        return "true" if value else "false"
-    return ""
-
-
-def _ensure_string_list(value: Any) -> list[str]:
-    """
-    Normalize a list-like structure into a list of non-empty strings.
-    Supports plain strings, dicts with label/text/value, or nested lists.
-    """
-    result: list[str] = []
-
-    if isinstance(value, list):
-        items = value
-    elif isinstance(value, dict):
-        items = [value]
-    elif isinstance(value, str):
-        items = [part.strip() for part in value.split("\n") if part.strip()]
-    else:
-        items = []
-
-    for item in items:
-        if isinstance(item, dict):
-            text = (
-                _ensure_text(item.get("label"))
-                or _ensure_text(item.get("value"))
-                or _ensure_text(item.get("text"))
-            )
-        else:
-            text = _ensure_text(item)
-        if text:
-            result.append(text)
-
-    return result
-
-
-def normalize_study_widget_payload(data: dict[str, Any]) -> dict[str, Any]:
-    """
-    Best-effort normalization to ensure the Study widget payload always matches
-    the schema expected by study.widget. Fills in sensible defaults when data
-    is missing or malformed.
-    """
-    payload_source: dict[str, Any] = {}
-    if isinstance(data, dict):
-        if isinstance(data.get("payload"), dict):
-            payload_source = data["payload"]
-        else:
-            payload_source = data
-
-    title = _ensure_text(payload_source.get("title")) or "Doctrine Study Card"
-
-    sections_input = payload_source.get("sections")
-    normalized_sections: list[dict[str, Any]] = []
-
-    if isinstance(sections_input, list):
-        for idx, raw_sec in enumerate(sections_input):
-            if not isinstance(raw_sec, dict):
-                continue
-            label = _ensure_text(raw_sec.get("label")) or f"Section {idx + 1}"
-            section: dict[str, Any] = {"label": label}
-
-            content = _ensure_text(raw_sec.get("content"))
-            section["content"] = content
-
-            bullets = _ensure_string_list(raw_sec.get("bullets"))
-            section["bullets"] = bullets
-
-            questions_out: list[dict[str, Any]] = []
-            raw_questions = raw_sec.get("questions")
-            if isinstance(raw_questions, list):
-                for q_idx, raw_q in enumerate(raw_questions):
-                    if not isinstance(raw_q, dict):
-                        continue
-                    question_text = _ensure_text(raw_q.get("question"))
-                    choices = _ensure_string_list(raw_q.get("choices"))
-                    if not question_text or not choices:
-                        continue
-                    question = {
-                        "id": _ensure_text(raw_q.get("id")) or f"{idx + 1}-{q_idx + 1}",
-                        "question": question_text,
-                        "choices": choices[:4],
-                        "correct": _ensure_text(raw_q.get("correct")) or choices[0],
-                    }
-                    questions_out.append(question)
-
-            section["questions"] = questions_out
-
-            if not section["content"]:
-                section["content"] = "Content unavailable in doctrine files."
-
-            normalized_sections.append(section)
-
-    if not normalized_sections:
-        normalized_sections.append(
-            {
-                "label": "Explanation",
-                "content": "Doctrine content not available. Provide official references to build this lesson.",
-                "bullets": [],
-                "questions": [],
-            }
-        )
-
-    next_steps = _ensure_string_list(payload_source.get("next_steps"))
-    if not next_steps:
-        next_steps = [
-            "Share official doctrine passages for deeper study.",
-            "Outline scenarios or drills to apply this lesson.",
-        ]
-
-    normalized_payload = {
-        "title": title,
-        "sections": normalized_sections,
-        "next_steps": next_steps,
-    }
-    return {"payload": normalized_payload}
-
-import math
-from typing import Any, Dict
-
-OSM_TILE_URL = "https://tile.openstreetmap.org/{z}/{x}/{y}.png"
-
-
-def latlng_to_tile(lat: float, lon: float, zoom: int) -> tuple[int, int]:
-    lat_rad = math.radians(lat)
-    n = 2.0 ** zoom
-    x_tile = int((lon + 180.0) / 360.0 * n)
-    y_tile = int(
-        (1.0 - math.log(math.tan(lat_rad) + 1.0 / math.cos(lat_rad)) / math.pi)
-        / 2.0
-        * n
-    )
-    return x_tile, y_tile
-
-
-def build_osm_tile_map_payload(
-    lat: float,
-    lng: float,
-    zoom: int = 1,
-) -> Dict[str, Any]:
-    x_tile, y_tile = latlng_to_tile(lat, lng, zoom)
-
-    src = OSM_TILE_URL.format(z=zoom, x=x_tile, y=y_tile)
-    alt = f"OpenStreetMap tile at lat={lat:.4f}, lon={lng:.4f}, z={zoom}"
-
-    return {
-        "src": src,
-        "alt": alt,
-        "lat": lat,
-        "lng": lng,
-        "zoom": zoom,
-    }
-
-
-
-
-import re
-
-def extract_html(raw: str) -> str:
-    # Try to isolate the <html>...</html> block
-    m = re.search(r"(<html[\\s\\S]*</html>)", raw)
-    return m.group(1).strip() if m else raw.strip()
-
-
-
-
+# =====================================================
+# ORCHESTRATOR (workflow)
+# =====================================================
 class Orchestrator:
+    """
+    Implements:
+    A[System runs Global Diagnostic QCM] --> B[Diagnostic-QCM_Agent]
+    B --> C[Score + Find-Weakness_Agent]
+    C --> D[Micro-lesson_Agent]
+    D --> E[Practice-QCM_Agent]
+    E --> F{Score < threshold?}
+    F -- YES --> G[Explain-mistake_Agent]
+    G --> D
+    F -- NO --> H[Validated -> Next KC/Module or Stop]
+    """
+
     def __init__(self):
-        self.router = RouterAgent()
-        self.doctrine = DoctrineAgent()
-        self.schema_agent = SchemaAgent()
-        self.study_agent = StudyAgent()
-        self.qcm_agent = QcmAgent()
+        # load KC graph once
+        self.graph = KcGraph.load(KC_GRAPH_PATH)
+
+        # workflow agents
+        self.diagnostic_qcm = DiagnosticQcmAgent()
+        self.scorer = ScoreFindWeaknessAgent()
+        self.micro_lesson = MicroLessonAgent()
+        self.practice_qcm = PracticeQcmAgent()
+        self.explain_mistake = ExplainMistakeAgent()
+        self.module_qcm = ModuleQcmAgent()
+        # compatibility with your server
         self.evaluator = EvaluatorAgent()
-        self.plotly_agent = PlotlyMCPAgent() 
-        # NOTE: single global store; for multi-thread safety, key this by thread_id
-        self.hidden_answers: Dict[int, str] | None = None
-        self.last_qcm_payload: QcmPayload | None = None
-        self.last_qcm_widget_data: dict | None = None
+        self.hidden_answers: Dict[int, str] | None = None  # <-- server reads this in qcm.submit
 
-    async def handle(self, user_input: Any, ctx: AgentContext) -> Any:
-        # RouterAgent.classify is now async (uses Runner)
-        latest_text = user_input
+        # sessions per thread
+        self._sessions: Dict[str, Session] = {}
 
-        intent = await self.router.classify(latest_text, ctx)
-
-        if intent == "DOCTRINE_QUERY":
-            return await self.doctrine.answer(latest_text, ctx)
-
-        elif intent == "QUIZ_REQUEST":
-            qcm = await self.qcm_agent.generate(ctx)   # ✅ returns QcmPayload
-            self.hidden_answers = qcm.hidden
-
-            # Build widget-compatible data
-            qcm_data = qcm_payload_to_widget_data(qcm)
-
-            # Server will see this and render a widget
-            return {"type": "qcm", "data": qcm_data}
-
-        elif intent == "STUDY_CARD_REQUEST":
-            study_data = await self.study_agent.create_course(latest_text, ctx)
-            return {"type": "study", "data": study_data}
-
-        elif intent == "SCHEMA_REQUEST":
-            return await self.schema_agent.build_schema(latest_text, ctx)
-        
-        elif intent == "MAP_REQUEST":
-            # For now: return fixed coordinates (London-like example).
-            # Later you can parse coordinates from the user message.
-            payload = build_osm_tile_map_payload(
-                lat=51.5,
-                lng=-0.09,
-                zoom=13,
-            )
-            return {"type": "map", "data": payload}
-        
-        elif intent == "PLOTLY_REQUEST":
-            text = self.extract_latest_user_text(user_input)
-            raw = await self.plotly_agent.build_chart(text, ctx)  # this returns the MCP string you pasted
-            html = extract_html(raw)
-
-            # Send a widget payload to ChatKit
-            return {
-                "type": "plotly",          # your custom widget type
-                "data": {
-                    "html": html,
-                    "title": "Trafic boutique",         # full <html>...</html> content
-                },
-            }
-
-        
-        elif intent == "EVALUATION_REQUEST":
-            if not self.hidden_answers:
-                return "⚠️ Please generate a QCM first."
-
-            answers = self.parse_answers(user_input)
-            score, score20, details = self.evaluator.evaluate(
-                answers, self.hidden_answers
-            )
-            return self.format_evaluation(score, score20, details)
-
-        else:
-            return "Unknown request."
-
-    # -----------------------------------------------------
-
-    def extract_latest_user_text(self, text: Any) -> str:
-        """
-        Extract the most recent user-authored text block from ChatKit-style items
-        or fall back to a plain string.
-        """
-        if isinstance(text, list):
-            for msg in reversed(text):
-                if not isinstance(msg, dict):
-                    continue
-                if msg.get("role") != "user":
-                    continue
-                for block in msg.get("content", []):
-                    if block.get("type") == "input_text":
-                        candidate = (block.get("text") or "").strip()
-                        if candidate:
-                            return candidate
-            return ""
-        return str(text or "").strip()
-
-    # -----------------------------------------------------
-
-    def parse_answers(self, text: Any) -> Dict[int, str]:
-        """
-        Accepts either:
-        - a plain string: "1A 2C 3B"
-        - or a list of ChatKit/Agent-style message dicts, like the debug print
-
-        Returns: {1: "A", 2: "C", 3: "B"}
-        """
-        # ---------------------------------------
-        # 1) Normalize to text
-        # ---------------------------------------
-        text_str = self.extract_latest_user_text(text)
-
-        print("answers (clean) :::", text_str)
-
-        # ---------------------------------------
-        # 2) Your original parsing logic
-        # ---------------------------------------
-        out: Dict[int, str] = {}
-        text_str = text_str.replace("answers:", "").replace("réponses:", "")
-        for token in text_str.split():
-            if len(token) >= 2 and token[0].isdigit():
-                out[int(token[0])] = token[1].upper()
-        return out
-
-
-    # -----------------------------------------------------
-    def format_qcm(self, qcm: QcmPayload) -> str:
-        lines = ["🔥 QCM (3 questions)\n"]
-        for q in qcm.visible:
-            lines.append(f"Q{q.number}. {q.text}")
-            lines.append(f"A) {q.choices[0]}")
-            lines.append(f"B) {q.choices[1]}")
-            lines.append(f"C) {q.choices[2]}")
-            lines.append(f"D) {q.choices[3]}\n")
-        lines.append("➡️ Reply like: 1A 2C 3B")
-        return "\n".join(lines)
-
-    # -----------------------------------------------------
+    # --------------------------
+    # Compatibility method used in your server
+    # --------------------------
     def format_evaluation(self, score, score20, details):
         return f"""📊 Evaluation
 
-Score: {score}/3
+Score: {score}/{len(details)}
 Score /20: {score20}
 
 Details:
 {chr(10).join(details)}
 """
+
+    # --------------------------
+    def _get_sess(self, ctx: AgentContext) -> Session:
+        tid = getattr(ctx.thread, "id", "default-thread")
+        if tid not in self._sessions:
+            self._sessions[tid] = Session()
+        return self._sessions[tid]
+
+    def _kc_nodes_for_diagnostic(self) -> List[KCNode]:
+        # pick up to 8 KCs from the graph (can be improved later)
+        ids = self.graph.kc_ids()
+        picked = ids[: min(len(ids), 8)]
+        return [self.graph.nodes[i] for i in picked if i in self.graph.nodes]
+
+    def _kc_ref_pages(self, kc: KCNode) -> List[int]:
+        pages = [p for p in kc.pages if isinstance(p, int) and p > 0]
+        return sorted(set(pages))
+
+    def _build_lesson_with_refs(self, kc: KCNode, lesson_text: str) -> Dict[str, Any]:
+        pages = self._kc_ref_pages(kc)
+        if not pages:
+            return {"type": "lesson_with_ref", "text": lesson_text}
+
+        refs_txt = ", ".join(f"p.{p}" for p in pages)
+        full_text = f"{lesson_text}\n\nReferences: {refs_txt}"
+
+        first_page = pages[0]
+        pdf_name = self.graph.source_pdf or "Charte graphique 2025 - Impression.pdf"
+        pdf_url = f"http://127.0.0.1:8000/static/{quote(pdf_name)}#page={first_page}"
+        html = ""
+
+        return {
+            "type": "lesson_with_ref",
+            "text": full_text,
+            "ref_widget": {
+                "title": f"Source - {kc.title}",
+                "subtitle": f"Reference: p.{first_page}",
+                "buttonLabel": f"Open source p.{first_page}",
+                "icon": "analytics",
+                "url": pdf_url,
+                "html": html,
+            },
+        }
+
+
+    async def _next_kc_micro_lesson(self, sess: Session, ctx: AgentContext) -> Any:
+        # must have a current KC
+        if not sess.current_kc_id:
+            return "⚠️ No current KC. Type: start diagnostic"
+
+        # ✅ Gate check: only after passing practice for this KC
+        if not sess.can_advance or sess.validated_kc_id != sess.current_kc_id:
+            return (
+                "⚠️ You can type `next` only after validating the current KC.\n"
+                "Type: practice"
+            )
+        # ✅ New: module gate check
+        if sess.module_gate_locked:
+            mod_title = "Module"
+            if sess.pending_module_id and sess.pending_module_id in self.graph.nodes:
+                mod_title = self.graph.nodes[sess.pending_module_id].title
+            return (
+                f"⚠️ You must pass the module checkpoint quiz for: {mod_title}\n"
+                f"Submit the module quiz (if shown), or type: practice to remediate."
+            )
+
+        nxt = sess.pending_next_kc_id or self.graph.next_kc(sess.current_kc_id)
+        if not nxt or nxt not in self.graph.nodes:
+            sess.can_advance = False
+            sess.validated_kc_id = None
+            sess.pending_next_kc_id = None
+            return "🏁 No next KC. You finished the course sequence."
+
+        sess.current_kc_id = nxt
+        sess.pending_next_kc_id = None
+        sess.scope = "practice"
+        sess.phase = "idle"
+
+        # reset adaptation memory
+        sess.last_mistakes_summary = ""
+        sess.current_micro_lesson = ""
+
+        # ✅ Lock gate again until next KC is passed
+        sess.can_advance = False
+        sess.validated_kc_id = None
+        sess.pending_next_kc_id = None
+        
+        kc = self.graph.nodes[nxt]
+        lesson_text = await self.micro_lesson.build(kc, ctx)
+        sess.current_micro_lesson = lesson_text
+
+        text = (
+            f"📘 Next KC: {kc.title}\n\n"
+            f"{lesson_text}\n\n"
+            f"➡️ Type: practice"
+        )
+        return self._build_lesson_with_refs(kc, text)
+    
+    async def _show_radar(self, sess: Session) -> dict:
+        groups = self.graph.container_groups_for_radar()
+        container_ids = self.graph.container_ids_in_order()
+
+        views = {}
+
+        # View 1: Containers radar (container score = avg KC mastery)
+        labels, vals = [], []
+        for cid in container_ids:
+            kc_ids = groups.get(cid, [])
+            if cid == "ROOT":
+                title = "ROOT"
+            else:
+                title = self.graph.nodes[cid].title if cid in self.graph.nodes else cid
+
+            m = [float(sess.mastery.get(k, 0.0)) for k in kc_ids]
+            score = (sum(m) / max(1, len(m))) if m else 0.0
+
+            labels.append(title)
+            vals.append(score)
+
+        views["modules"] = {"label": "Sections", "labels": labels, "values": vals}
+
+        # View per container: its KCs
+        for cid in container_ids:
+            kc_ids = groups.get(cid, [])
+            title = "ROOT" if cid == "ROOT" else (self.graph.nodes[cid].title if cid in self.graph.nodes else cid)
+
+            kc_labels, kc_vals = [], []
+            for kid in kc_ids:
+                n = self.graph.nodes.get(kid)
+                if not n:
+                    continue
+                kc_labels.append(n.title)
+                kc_vals.append(float(sess.mastery.get(kid, 0.0)))
+
+            views[f"sec::{cid}"] = {
+                "label": f"KCs: {title}",
+                "labels": kc_labels,
+                "values": kc_vals,
+            }
+
+        html = build_radar_dashboard_html("Radar — Sections & KCs", views, default_view="modules")
+
+        return {
+            "type": "radar",
+            "data": {"name": "Radar — Sections & KCs", "buttonLabel": "Open radar", "html": html},
+        }
+
+
+
+
+
+
+    # =====================================================
+    # MAIN ENTRY (called by chatkit_server.respond)
+    # =====================================================
+    async def handle(self, user_input: Any, ctx: AgentContext) -> Any:
+        text = extract_latest_user_text(user_input).strip()
+        low = text.lower()
+
+        sess = self._get_sess(ctx)
+
+        # ---- start diagnostic
+        if low in {"start diagnostic", "diagnostic", "start"}:
+            return await self._start_diagnostic(sess, ctx)
+
+        # ---- practice on current weakness
+        if low in {"practice", "practice qcm", "qcm"}:
+            if not sess.current_kc_id:
+                return "⚠️ No weakness KC selected yet. Type: start diagnostic"
+            return await self._start_practice(sess, ctx)
+        # ---- go to next KC and show micro-lesson
+        if low in {"next", "next kc", "continue"}:
+            if not sess.current_kc_id:
+                return "⚠️ No current KC. Type: start diagnostic"
+            return await self._next_kc_micro_lesson(sess, ctx)
+        # ---- if user typed answers in chat (optional path)
+        if low in {"checkpoint", "retry", "module quiz"}:
+            if not sess.pending_module_id:
+                return "⚠️ No module checkpoint pending."
+            if not sess.pending_module_retry:
+                return "⚠️ No retry requested. Submit the module quiz first."
+            sess.pending_module_retry = False
+            return await self._start_module_quiz(sess, sess.pending_module_id, ctx)
+        if low in {"radar", "show radar", "evaluation radar"}:
+            return await self._show_radar(sess)
+        if low in {"debug mastery", "mastery debug", "show mastery"}:
+            lines = [
+                f"scope={sess.scope}",
+                f"phase={sess.phase}",
+                f"current_kc_id={sess.current_kc_id}",
+            ]
+            if not sess.mastery:
+                lines.append("mastery=(empty)")
+            else:
+                for kid, val in sorted(sess.mastery.items()):
+                    title = self.graph.nodes[kid].title if kid in self.graph.nodes else kid
+                    last = sess.last_score_by_kc.get(kid, 0.0)
+                    lines.append(f"{kid} | {title} | mastery={val:.3f} | latest={last:.3f}")
+            return "\n".join(lines)
+
+
+        if looks_like_answers(text):
+            answers = parse_answers_from_text(text)
+            return await self._process_answers(sess, answers, ctx)
+
+        # ---- default help
+        return (
+            "Commands:\n"
+            "- start diagnostic\n"
+            "- practice\n"
+            "Then answer like: 1A 2C 3B (or submit the QCM widget)."
+        )
+
+    # =====================================================
+    # INTERNAL STEPS
+    # =====================================================
+    async def _start_diagnostic(self, sess: Session, ctx: AgentContext) -> Any:
+        kcs = self._kc_nodes_for_diagnostic()
+        if not kcs:
+            return "⚠️ No KCs found in kc_graph1.json."
+
+        questions = await self.diagnostic_qcm.generate(kcs, DIAGNOSTIC_Q_NUM, ctx)
+
+        # build hidden answers + mapping
+        hidden: Dict[int, str] = {}
+        q_to_kc: Dict[int, str] = {}
+        q_text: Dict[int, dict] = {}
+
+        for q in questions:
+            num = int(q["number"])
+            hidden[num] = str(q["answer"]).upper().strip()
+            kc_id = str(q.get("kc_id") or "").strip()
+            if kc_id not in self.graph.nodes:
+                kc_id = kcs[0].id  # fallback
+            q_to_kc[num] = kc_id
+
+            q_text[num] = {"text": q["text"], "choices": q["choices"]}
+
+        sess.scope = "diagnostic"
+        sess.phase = "waiting_answers"
+        sess.last_hidden_answers = hidden
+        sess.last_question_to_kc = q_to_kc
+        sess.last_question_text = q_text
+
+        # server compatibility
+        self.hidden_answers = hidden
+        print(self.hidden_answers)
+        data = qcm_widget_data(
+            title=f"Global Diagnostic QCM — {self.graph.title}",
+            questions=questions,
+        )
+        return {"type": "qcm", "data": data}
+
+    async def _start_practice(self, sess: Session, ctx: AgentContext) -> Any:
+        kc = self.graph.nodes.get(sess.current_kc_id or "")
+        # ✅ RESET gate at the start of each practice attempt
+        sess.can_advance = False
+        sess.validated_kc_id = None
+        if not kc:
+            return "⚠️ Current KC not found."
+
+
+        # Ensure we have a micro-lesson for this KC (Option B needs it)
+        if not sess.current_micro_lesson.strip():
+            sess.current_micro_lesson = await self.micro_lesson.build(kc, ctx)
+            sess.last_mistakes_summary = ""
+
+        micro = sess.current_micro_lesson.strip()
+        mistakes = sess.last_mistakes_summary.strip() or "(No mistakes yet; first practice attempt.)"
+
+        pack = await self.practice_qcm.generate_adaptive(kc, micro, mistakes, ctx)
+        n, questions = normalize_adaptive_practice_pack(pack, PRACTICE_MIN_Q, PRACTICE_MAX_Q)
+
+        # Validate questions shape
+        def _is_valid_q(q: dict) -> bool:
+            return (
+                isinstance(q, dict)
+                and isinstance(q.get("text"), str)
+                and isinstance(q.get("choices"), list)
+                and len(q["choices"]) == 4
+                and str(q.get("answer", "")).upper() in {"A", "B", "C", "D"}
+            )
+
+        questions = [q for q in questions if _is_valid_q(q)]
+        n = len(questions)
+
+        # Hard fallback if model returned invalid JSON / invalid questions
+        if n == 0:
+            n = PRACTICE_MIN_Q
+            questions = [{
+                "number": i,
+                "text": "Fallback question (model output invalid).",
+                "choices": ["Option A", "Option B", "Option C", "Option D"],
+                "answer": "A",
+            } for i in range(1, n + 1)]
+
+        hidden: Dict[int, str] = {}
+        q_to_kc: Dict[int, str] = {}
+        q_text: Dict[int, dict] = {}
+
+        for q in questions:
+            num = int(q["number"])
+            hidden[num] = str(q["answer"]).upper().strip()
+            q_to_kc[num] = kc.id
+            q_text[num] = {"text": q["text"], "choices": q["choices"]}
+
+        sess.scope = "practice"
+        sess.phase = "waiting_answers"
+        sess.last_hidden_answers = hidden
+        sess.last_question_to_kc = q_to_kc
+        sess.last_question_text = q_text
+
+        self.hidden_answers = hidden
+        print(self.hidden_answers)
+        data = qcm_widget_data(
+            title=f"Practice QCM — {kc.title} ({n} questions)",
+            questions=questions,
+        )
+        return {"type": "qcm", "data": data}
+    
+    async def _start_module_quiz(self, sess: Session, module_id: str, ctx: AgentContext) -> Any:
+        # build KC list for the module
+        module_kc_ids = self.graph.module_kcs(module_id)
+        module_kcs = [self.graph.nodes[i] for i in module_kc_ids if i in self.graph.nodes]
+
+        if not module_kcs:
+            # nothing to quiz -> unlock module and continue
+            sess.module_gate_locked = False
+            sess.pending_module_id = None
+            return "⚠️ Module has no KCs to quiz."
+
+        # choose number of questions (same heuristic)
+        n_module_q = max(MODULE_MIN_Q, min(MODULE_MAX_Q, max(8, len(module_kcs) * 2)))
+
+        questions = await self.module_qcm.generate(
+            module_title=self.graph.nodes[module_id].title if module_id in self.graph.nodes else "Module",
+            kc_list=module_kcs,
+            n_questions=n_module_q,
+            ctx=ctx,
+        )
+
+        # store quiz state
+        hidden: Dict[int, str] = {}
+        q_to_kc: Dict[int, str] = {}
+        q_text: Dict[int, dict] = {}
+
+        for q in questions:
+            num = int(q["number"])
+            hidden[num] = str(q["answer"]).upper().strip()
+            kc_id = str(q.get("kc_id") or "").strip()
+            if kc_id not in self.graph.nodes:
+                kc_id = module_kcs[0].id
+            q_to_kc[num] = kc_id
+            q_text[num] = {"text": q["text"], "choices": q["choices"]}
+
+        sess.scope = "module_quiz"
+        sess.phase = "waiting_answers"
+        sess.last_hidden_answers = hidden
+        sess.last_question_to_kc = q_to_kc
+        sess.last_question_text = q_text
+
+        self.hidden_answers = hidden
+        print(self.hidden_answers)
+
+        data = qcm_widget_data(
+            title=f"✅ Module Checkpoint — {self.graph.nodes[module_id].title if module_id in self.graph.nodes else 'Module'}",
+            questions=questions,
+        )
+        return {"type": "qcm", "data": data}
+
+
+
+    async def _process_answers(self, sess: Session, answers: Dict[int, str], ctx: AgentContext) -> Any:
+        if sess.phase != "waiting_answers" or not sess.last_hidden_answers:
+            return "⚠️ No active QCM. Type: start diagnostic"
+
+        correct = sess.last_hidden_answers
+        q_to_kc = sess.last_question_to_kc
+
+        weakness_kc_id, overall, per_kc = self.scorer.find_weakness(q_to_kc, answers, correct)
+
+        # update mastery (EMA)
+        # update mastery (EMA) — FIXED (no 30% on first observation)
+        for kc_id, (c_cnt, t_cnt) in per_kc.items():
+            score = (c_cnt / t_cnt) if t_cnt else 1.0
+            sess.last_score_by_kc[kc_id] = score
+
+            if sess.scope == "practice":
+                alpha = 0.8
+            elif sess.scope == "diagnostic":
+                alpha = 0.2
+            else:
+                alpha = 0.4
+
+            if kc_id not in sess.mastery:
+                sess.mastery[kc_id] = score
+            else:
+                old = sess.mastery[kc_id]
+                sess.mastery[kc_id] = (1 - alpha) * old + alpha * score
+
+
+
+
+        # DIAGNOSTIC => pick weakness then micro-lesson
+        if sess.scope == "diagnostic":
+            if not weakness_kc_id:
+                return "✅ Diagnostic done, but I couldn't map weakness to a KC. Try practice."
+
+            sess.current_kc_id = weakness_kc_id
+            kc = self.graph.nodes.get(weakness_kc_id)
+            if not kc:
+                return "✅ Diagnostic done. Weakness KC missing in graph."
+
+            # produce micro-lesson
+            lesson_text = await self.micro_lesson.build(kc, ctx)
+            sess.current_micro_lesson = lesson_text
+            sess.last_mistakes_summary = ""
+
+            sess.phase = "idle"
+            self.hidden_answers = None
+
+            return self._build_lesson_with_refs(kc, lesson_text)
+        
+        if sess.scope == "module_quiz":
+            module_id = sess.pending_module_id
+            module_score = overall
+
+            # Build wrong_items for explanation
+            wrong_items: List[dict] = []
+            for qnum, corr in correct.items():
+                u = answers.get(qnum, "")
+                if u.upper() != corr.upper():
+                    qinfo = sess.last_question_text.get(qnum, {})
+                    wrong_items.append({
+                        "number": qnum,
+                        "question": qinfo.get("text", ""),
+                        "choices": qinfo.get("choices", []),
+                        "correct_letter": corr,
+                        "learner_letter": u,
+                    })
+
+            # Always clear quiz buffers after submission (prevents stale state bugs)
+            sess.last_hidden_answers = {}
+            sess.last_question_to_kc = {}
+            sess.last_question_text = {}
+            self.hidden_answers = None
+            sess.phase = "idle"
+
+            if module_id:
+                sess.module_mastery[module_id] = module_score
+
+            # ---------- FAIL: explain + regenerate module quiz ----------
+            if module_score < MODULE_THRESHOLD:
+                sess.module_gate_locked = True
+                sess.pending_module_retry = True
+
+                # build wrong_items
+                wrong_items = []
+                for qnum, corr in correct.items():
+                    u = answers.get(qnum, "")
+                    if u.upper() != corr.upper():
+                        qinfo = sess.last_question_text.get(qnum, {})
+                        wrong_items.append({
+                            "number": qnum,
+                            "question": qinfo.get("text", ""),
+                            "choices": qinfo.get("choices", []),
+                            "correct_letter": corr,
+                            "learner_letter": u,
+                        })
+
+                module_title = self.graph.nodes[module_id].title if (module_id and module_id in self.graph.nodes) else "Module"
+                dummy_module_node = KCNode(id=module_id or "module", title=module_title, kind="module")
+
+                expl = await self.explain_mistake.explain(dummy_module_node, wrong_items, ctx)
+                sess.last_module_feedback = expl  # optional
+
+                # clear QCM state
+                sess.last_hidden_answers = {}
+                sess.last_question_to_kc = {}
+                sess.last_question_text = {}
+                self.hidden_answers = None
+                sess.scope = "idle"
+                sess.phase = "idle"
+
+                return (
+                    f"{expl}\n\n"
+                    f"❌ Module not validated (score={module_score:.0%}, need {MODULE_THRESHOLD:.0%}).\n"
+                    f"➡️ Type: checkpoint  (or retry) to generate a new module quiz."
+                )
+
+
+            # ---------- PASS: unlock + auto-move to next KC ----------
+            sess.module_gate_locked = False
+            sess.pending_module_id = None
+
+            nxt = sess.pending_next_kc_id
+            if not nxt or nxt not in self.graph.nodes:
+                return f"✅ Module validated (score={module_score:.0%}). 🏁 End of course."
+
+            # Move to next KC automatically
+            sess.current_kc_id = nxt
+            sess.scope = "practice"
+            sess.phase = "idle"
+
+            # reset per-KC adaptation + lock gate until KC practice passes
+            sess.can_advance = False
+            sess.validated_kc_id = None
+            sess.pending_next_kc_id = None
+            sess.last_mistakes_summary = ""
+            sess.current_micro_lesson = ""
+
+            kc = self.graph.nodes[nxt]
+            lesson_text = await self.micro_lesson.build(kc, ctx)
+            sess.current_micro_lesson = lesson_text
+
+            text = (
+                f"✅ Module validated (score={module_score:.0%}).\n"
+                f"📘 Next KC: {kc.title}\n\n"
+                f"{lesson_text}\n\n"
+                f"➡️ Type: practice"
+            )
+            return self._build_lesson_with_refs(kc, text)
+
+
+
+
+        # PRACTICE => pass/fail loop
+        if sess.scope == "practice":
+            kc_id = sess.current_kc_id
+            kc = self.graph.nodes.get(kc_id or "") if kc_id else None
+            if not kc:
+                return "⚠️ Practice evaluated, but current KC missing."
+
+            # determine score on this KC
+            c_cnt, t_cnt = per_kc.get(kc.id, (0, len(correct)))
+            practice_score = (c_cnt / max(1, t_cnt))
+            # ✅ PASS => unlock "next" for THIS KC only
+
+            if practice_score < THRESHOLD:
+                # ✅ FAIL => keep next locked
+                sess.can_advance = False
+                sess.validated_kc_id = None
+
+                wrong_items: List[dict] = []
+                for qnum, corr in correct.items():
+                    u = answers.get(qnum, "")
+                    if u.upper() != corr.upper():
+                        qinfo = sess.last_question_text.get(qnum, {})
+                        wrong_items.append({
+                            "number": qnum,
+                            "question": qinfo.get("text", ""),
+                            "choices": qinfo.get("choices", []),
+                            "correct_letter": corr,
+                            "learner_letter": u,
+                        })
+
+                expl = await self.explain_mistake.explain(kc, wrong_items, ctx)
+                lesson_text = await self.micro_lesson.build(kc, ctx)
+
+                # ✅ store lesson + mistakes for adaptive practice
+                sess.current_micro_lesson = lesson_text
+
+                lines = []
+                for wi in wrong_items[:8]:
+                    q_short = (wi.get("question", "") or "")[:180]
+                    lines.append(f"Q{wi['number']}: learner={wi.get('learner_letter','?')} correct={wi.get('correct_letter','?')} | {q_short}")
+                sess.last_mistakes_summary = "\n".join(lines)
+
+
+                sess.phase = "idle"
+                self.hidden_answers = None
+
+                text = (
+                    f"{expl}\n\n"
+                    f"---\n"
+                    f"{lesson_text}\n\n"
+                    f"➡️ Type: practice  (to retry the KC QCM)"
+                )
+                return self._build_lesson_with_refs(kc, text)
+
+
+
+
+            # ✅ PASS => unlock next for THIS KC
+            sess.can_advance = True
+            sess.validated_kc_id = kc.id
+
+            # store pending next (do NOT move now)
+            nxt = self.graph.next_kc(kc.id)
+            sess.pending_next_kc_id = nxt if (nxt and nxt in self.graph.nodes) else None
+            cur_module = self.graph.module_of(kc.id)
+            next_module = self.graph.module_of(nxt) if nxt else None
+            sess.current_module_id = cur_module
+
+            # if end-of-module (next KC is in another module OR no next KC)
+            if cur_module and (not nxt or next_module != cur_module):
+                sess.pending_module_id = cur_module
+                sess.module_gate_locked = True
+                sess.pending_module_retry = False
+                return await self._start_module_quiz(sess, cur_module, ctx)
+
+                
+            # clear quiz state (keep current_kc_id as the validated KC!)
+            sess.phase = "idle"
+            sess.last_hidden_answers = {}
+            sess.last_question_to_kc = {}
+            sess.last_question_text = {}
+            self.hidden_answers = None
+
+            if sess.pending_next_kc_id:
+                next_kc = self.graph.nodes[sess.pending_next_kc_id]
+                return (
+                    f"✅ Validated KC: {kc.title} (score={practice_score:.0%}).\n"
+                    f"➡️ Next KC: {next_kc.title}\n"
+                    f"Type: next"
+                )
+
+            return (
+                f"✅ Validated KC: {kc.title} (score={practice_score:.0%}).\n"
+                f"🏁 No next KC. You finished the course sequence."
+            )
+
+
+
+        sess.phase = "idle"
+        self.hidden_answers = None
+        return "✅ Done."
+
+    # =====================================================
+    # OPTIONAL: hook for your server's qcm.submit action
+    # If you later update chatkit_server.py, call this.
+    # =====================================================
+    async def handle_qcm_submit(self, submitted_answers: Dict[int, str], ctx: AgentContext) -> Any:
+        sess = self._get_sess(ctx)
+        return await self._process_answers(sess, submitted_answers, ctx)

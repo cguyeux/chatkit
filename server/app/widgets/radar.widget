@@ -1,0 +1,16 @@
+{
+  "version": "1.0",
+  "name": "Radar",
+  "template": "{\"type\":\"Card\",\"size\":\"sm\",\"children\":[{\"type\":\"Row\",\"align\":\"center\",\"children\":[{\"type\":\"Title\",\"value\":{{ name | default('Radar') | tojson }},\"size\":\"md\"},{\"type\":\"Spacer\"},{\"type\":\"Button\",\"label\":{{ buttonLabel | default('Open') | tojson }},\"onClickAction\":{\"type\":\"report.open\",\"handler\":\"client\",\"payload\":{\"title\":{{ name | default('Radar') | tojson }},\"html\":{{ html | default('') | tojson }} }}}]}]}",
+  "jsonSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "object",
+    "properties": {
+      "name": { "type": "string" },
+      "buttonLabel": { "type": "string" },
+      "html": { "type": "string" }
+    },
+    "required": ["name", "buttonLabel", "html"],
+    "additionalProperties": false
+  }
+}

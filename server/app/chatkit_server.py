@@ -30,6 +30,7 @@ from app.widgets.qcmwidget import build_qcm_widget_from_data
 from app.widgets.studywidget import build_study_widget_from_data
 from app.widgets.mapwidget import build_map_widget_from_data   
 from app.widgets.plotlywidget import build_plotly_widget_from_data
+from app.widgets.radarwidget import build_radar_widget_from_data
 
 # ChatKit helper for converting thread messages
 converter = ThreadItemConverter()
@@ -103,7 +104,21 @@ class MyChatKitServer(ChatKitServer[dict[str, Any]]):
 
                 yield ThreadItemDoneEvent(item=widget_item)
                 return
+            if result_type == "radar":
+                radar_data = result_text["data"]  # {title, html}
+                widget_root = build_radar_widget_from_data(radar_data)
 
+                widget_item = WidgetItem(
+                    thread_id=thread.id,
+                    id=self.store.generate_item_id("message", thread, context),
+                    created_at=datetime.now(),
+                    widget=widget_root,
+                    title=radar_data.get("title", "Radar"),
+                )
+
+                yield ThreadItemDoneEvent(item=widget_item)
+                return
+            
             if result_type == "study":
                 study_data = result_text["data"]
                 widget_root = build_study_widget_from_data(study_data)
@@ -150,6 +165,29 @@ class MyChatKitServer(ChatKitServer[dict[str, Any]]):
 
                 yield ThreadItemDoneEvent(item=widget_item)
                 return
+            if result_type == "lesson_with_ref":
+                lesson_text = str(result_text.get("text", "")).strip()
+                if lesson_text:
+                    message_item = AssistantMessageItem(
+                        thread_id=thread.id,
+                        id=self.store.generate_item_id("message", thread, context),
+                        created_at=datetime.now(),
+                        content=[AssistantMessageContent(text=lesson_text)],
+                    )
+                    yield ThreadItemDoneEvent(item=message_item)
+
+                ref_widget = result_text.get("ref_widget")
+                if isinstance(ref_widget, dict):
+                    widget_root = build_plotly_widget_from_data(ref_widget)
+                    widget_item = WidgetItem(
+                        thread_id=thread.id,
+                        id=self.store.generate_item_id("message", thread, context),
+                        created_at=datetime.now(),
+                        widget=widget_root,
+                        title=ref_widget.get("title", "Source"),
+                    )
+                    yield ThreadItemDoneEvent(item=widget_item)
+                return
 
         # else: normal text answer
         message_item = AssistantMessageItem(
@@ -172,35 +210,97 @@ class MyChatKitServer(ChatKitServer[dict[str, Any]]):
     ) -> AsyncIterator[ThreadStreamEvent]:
 
         if _action.type in ("map.open_external", "map.show_inline", "report.open"):
-            # Map/report actions are rendered client-side; log and ignore if they arrive here.
-            print(
-                "[MyChatKitServer.action] plotly/map action received (ignored on server):",
-                _action.type,
-                _action.payload,    
-            )
+            print("[MyChatKitServer.action] client-side action received (ignored on server):",
+                _action.type, _action.payload)
             return
 
         if _action.type == "qcm.submit":
-            if not self.orch.hidden_answers:
-                evaluation_text = "⚠️ Please generate and answer a quiz before submitting."
-            else:
-                submitted_answers = self._extract_answers_from_payload(_action.payload)
-                if not submitted_answers:
-                    evaluation_text = "⚠️ No answers received with the submission."
-                else:
-                    score, score20, details = self.orch.evaluator.evaluate(
-                        submitted_answers, self.orch.hidden_answers
-                    )
-                    evaluation_text = self.orch.format_evaluation(score, score20, details)
+            agent_context = AgentContext(
+                thread=_thread,
+                store=self.store,
+                request_context=_context,
+            )
 
+            submitted_answers = self._extract_answers_from_payload(_action.payload)
+            if not submitted_answers:
+                evaluation_text = "⚠️ No answers received with the submission."
+                message_item = AssistantMessageItem(
+                    thread_id=_thread.id,
+                    id=self.store.generate_item_id("message", _thread, _context),
+                    created_at=datetime.now(),
+                    content=[AssistantMessageContent(text=evaluation_text)],
+                )
+                yield ThreadItemDoneEvent(item=message_item)
+                return
+
+            # ✅ run the workflow step
+            result = await self.orch.handle_qcm_submit(submitted_answers, agent_context)
+
+            # render like respond()
+            if isinstance(result, dict):
+                rtype = result.get("type")
+
+                if rtype == "qcm":
+                    qcm_data = result["data"]
+                    widget_root = build_qcm_widget_from_data(qcm_data)
+                    widget_item = WidgetItem(
+                        thread_id=_thread.id,
+                        id=self.store.generate_item_id("message", _thread, _context),
+                        created_at=datetime.now(),
+                        widget=widget_root,
+                        title=qcm_data.get("title", "QCM"),
+                    )
+                    yield ThreadItemDoneEvent(item=widget_item)
+                    return
+
+                if rtype == "study":
+                    study_data = result["data"]
+                    widget_root = build_study_widget_from_data(study_data)
+                    payload = study_data.get("payload", {})
+                    widget_item = WidgetItem(
+                        thread_id=_thread.id,
+                        id=self.store.generate_item_id("message", _thread, _context),
+                        created_at=datetime.now(),
+                        widget=widget_root,
+                        title=payload.get("title", "Study card"),
+                    )
+                    yield ThreadItemDoneEvent(item=widget_item)
+                    return
+
+                if rtype == "lesson_with_ref":
+                    lesson_text = str(result.get("text", "")).strip()
+                    if lesson_text:
+                        message_item = AssistantMessageItem(
+                            thread_id=_thread.id,
+                            id=self.store.generate_item_id("message", _thread, _context),
+                            created_at=datetime.now(),
+                            content=[AssistantMessageContent(text=lesson_text)],
+                        )
+                        yield ThreadItemDoneEvent(item=message_item)
+
+                    ref_widget = result.get("ref_widget")
+                    if isinstance(ref_widget, dict):
+                        widget_root = build_plotly_widget_from_data(ref_widget)
+                        widget_item = WidgetItem(
+                            thread_id=_thread.id,
+                            id=self.store.generate_item_id("message", _thread, _context),
+                            created_at=datetime.now(),
+                            widget=widget_root,
+                            title=ref_widget.get("title", "Source"),
+                        )
+                        yield ThreadItemDoneEvent(item=widget_item)
+                    return
+
+            # fallback text
             message_item = AssistantMessageItem(
                 thread_id=_thread.id,
                 id=self.store.generate_item_id("message", _thread, _context),
                 created_at=datetime.now(),
-                content=[AssistantMessageContent(text=evaluation_text)],
+                content=[AssistantMessageContent(text=str(result))],
             )
             yield ThreadItemDoneEvent(item=message_item)
             return
+
 
         raise RuntimeError(f"Unsupported action type: {_action.type}")
     

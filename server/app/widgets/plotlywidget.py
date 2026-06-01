@@ -64,6 +64,7 @@ def build_plotly_widget_from_data(data: Dict[str, Any]) -> DynamicWidgetRoot:
             "handler": data.get("handler", "client"),
             "payload": {
                 "html": html,
+                "url": str(data.get("url") or ""),
                 "title": base_title,
             },
         },
