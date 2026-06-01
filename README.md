@@ -66,29 +66,4 @@ Open `http://localhost:3000`.
 - Attachment persistence is not fully implemented by default in `data_store.py`.
 - For production, replace `domainKey` and register your domain in OpenAI allowlist settings.
 
-## Push This Project to GitHub (`helmi1105/chatkit.git`)
 
-Run these commands from the project root:
-
-```powershell
-git init
-git add .
-git commit -m "Initial commit: ChatKit advanced integration demo"
-git branch -M main
-git remote add origin https://github.com/helmi1105/chatkit.git
-git push -u origin main
-```
-
-If `origin` already exists:
-
-```powershell
-git remote set-url origin https://github.com/helmi1105/chatkit.git
-git push -u origin main
-```
-
-If GitHub rejects push because remote already has commits:
-
-```powershell
-git pull origin main --rebase
-git push -u origin main
-```
