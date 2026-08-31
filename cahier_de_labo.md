@@ -100,3 +100,55 @@ dans l'allowlist correspond EXACTEMENT à
 `chatkitf92c84e6-web.functions.fnc.fr-par.scw.cloud` (sinon la clé ne matche
 pas) ; option proposée : remplacer la page noire silencieuse par un message
 d'erreur visible (non encore fait, à la demande).
+
+---
+
+## 2026-08-31 12h30 — Fork GitHub, merge amont, build+push+redeploy v3
+
+**Objectif.** Passer de « rien poussé sur le dépôt amont, déploiement à partir
+du seul code local » à un état versionné, sur demande explicite de l'utilisateur
+(« commit pull push et deploy sur scaleway »).
+
+**Changement de garde-fou.** `origin` pointe vers le dépôt amont public d'un
+tiers (`github.com/helmi1105/chatkit`), sur lequel l'utilisateur n'a pas de
+droits d'écriture — confirmé en clarifiant avec lui plutôt qu'en tentant un
+push aveugle. Choix retenu : créer un fork personnel `github.com/cguyeux/chatkit`
+(`gh repo fork helmi1105/chatkit`), ajouté comme remote `fork`, et y pousser.
+`origin` (helmi1105) reste intact, non touché.
+
+**Séquence.**
+1. Commit local des 9 fichiers de déploiement en attente depuis le
+   2026-06-08 (Dockerfiles, `.dockerignore`, `DEPLOY_SCALEWAY.md`, ce cahier,
+   correctifs `PUBLIC_BASE_URL` / `NEXT_PUBLIC_CHATKIT_*`).
+2. `git pull origin main` : 2 commits amont en attente (« Add adaptive ITS
+   workflow and learner guide », « update README »), touchant entre autres
+   `orchestrator.py` et `ChatKitComponent.tsx` — mêmes fichiers que nos
+   correctifs de déploiement. Conflit réel sur le bloc CONFIG
+   d'`orchestrator.py` (résolu à la main : conservé `PUBLIC_BASE_URL` local
+   + commentaire amont) ; `ChatKitComponent.tsx` fusionné automatiquement
+   par git (nos changements ne recoupaient pas ceux de l'amont).
+3. `git push fork main` : réussi.
+4. Rebuild + push registre Scaleway des deux images en `:v3` (les `:v1`/`:v2`
+   dataient d'avant le merge amont, donc du code obsolète côté backend
+   `orchestrator.py`/`main.py`/`data_store.py` et frontend `page.tsx`) :
+   - backend `api` -> `:v3`, `scw container container update` avec
+     re-passage de `OPENAI_API_KEY` (secret Scaleway, sinon risque de perte
+     documenté dans `DEPLOY_SCALEWAY.md`).
+   - frontend `web` -> `:v3`, rebuild avec les MÊMES `--build-arg` qu'en
+     prod (`NEXT_PUBLIC_CHATKIT_API_URL` inchangée, `NEXT_PUBLIC_CHATKIT_DOMAIN_KEY`
+     = `domain_pk_6a26fb39...` récupérée en clair depuis le bundle JS déjà
+     servi en prod, faute d'être stockée en local — clé publique par design,
+     non secrète).
+5. Vérification post-déploiement : frontend 200 avec la bonne `domain_pk_...`
+   bakée dans le bundle, backend répond 400 sur `POST /chatkit` sans header
+   (comportement attendu, auth active).
+
+**Incidents transitoires.** `docker login` a d'abord échoué (mauvais parsing
+du secret `scw`, corrigé en passant par `scw config get secret-key`) ; build
+frontend a échoué 2 fois sur `npm ci` (`ETIMEDOUT` puis `ECONNRESET`,
+instabilité réseau ponctuelle) avant de réussir au 3ᵉ essai — aucune action
+corrective nécessaire au-delà du retry.
+
+**Garde-fous respectés.** Rien poussé sur `origin` (helmi1105) ; clé OpenAI
+jamais affichée ni commitée, uniquement repassée en variable secrète Scaleway
+via `$OPENAI_API_KEY` de l'environnement local.
