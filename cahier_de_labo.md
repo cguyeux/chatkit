@@ -194,3 +194,29 @@ longue que prévu et throttling propre à ce point d'accès. Infrastructure
 Scaleway toujours saine (frontend/backend `:v3` répondent correctement).
 Test arrêté après 3 échecs consécutifs plutôt que de boucler ; à reprendre
 plus tard, sur nouvelle demande de l'utilisateur.
+
+---
+
+## 2026-08-31 16h40 — Overlay d'erreur ChatKit ; CDN OpenAI stabilisé ; round-trip validé en v4
+
+**Correctif appliqué.** `web/src/app/ChatKitComponent.tsx` : l'état `error`
+(déjà peuplé en cas d'échec de `chatkit.js` ou d'appel backend) n'était rendu
+nulle part — remplacé le commentaire placeholder `{/* error overlay ...
+(unchanged) */}` par un vrai overlay (message + bouton Retry qui recharge la
+page). `npx tsc --noEmit` propre avant build.
+
+**Build + déploiement.** `web` -> `:v4` (mêmes `--build-arg` qu'en `:v3` :
+URL backend et `domain_pk_...` inchangés), `scw container container update`
++ vérification.
+
+**Test navigateur réel (Claude-in-Chrome).** Le CDN OpenAI s'est stabilisé
+entre-temps : chargement propre (`script loaded`, `[app.init]`,
+`[composer.ready]`), écran d'accueil visible. Message "Hello!" envoyé depuis
+le composer -> réponse complète de l'agent (guide d'apprentissage en
+français, généré par le backend via l'API OpenAI). **Round-trip complet
+validé de bout en bout pour la première fois sur ce déploiement** (jamais
+fait lors du déploiement initial du 08/06, faute de navigateur connecté à
+l'époque).
+
+**Garde-fous respectés.** Rien poussé sur `origin` (helmi1105), uniquement
+sur `fork` (cguyeux). Aucune clé affichée ni commitée.
