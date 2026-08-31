@@ -300,11 +300,3 @@ feedback and remediation
 mastery tracking
 ```
 
-## Repository Hygiene
-
-For a public GitHub repository, avoid committing:
-
-- API keys or `.env` files
-- runtime uploads in `server/app/uploads/`
-- local logs if they contain private learner data
-- generated `.next/` build artifacts
