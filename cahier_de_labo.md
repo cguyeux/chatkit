@@ -182,3 +182,15 @@ du composant ChatKit jamais rendu visuellement (échec silencieux, panneau
 blanc/vide au lieu d'un message clair) — reste d'actualité et aggrave le
 diagnostic pour un futur incident CDN : proposé alors et toujours non fait,
 à la demande.
+
+**Complément (retest ~15 min plus tard, sur demande utilisateur).** Toujours
+en échec : 3 tentatives supplémentaires en navigateur réel, espacées
+(rechargement immédiat, puis +5s, puis +8s), donnent systématiquement 503 sur
+`cdn.platform.openai.com/deployments/chatkit/chatkit.js` — alors que le
+`curl` direct, lui, alterne 200/503/échec TLS sur les mêmes minutes. Cette
+persistance ne ressemble plus à un simple accident isolé ; sans accès à un
+tableau de bord de statut OpenAI, impossible de trancher entre panne plus
+longue que prévu et throttling propre à ce point d'accès. Infrastructure
+Scaleway toujours saine (frontend/backend `:v3` répondent correctement).
+Test arrêté après 3 échecs consécutifs plutôt que de boucler ; à reprendre
+plus tard, sur nouvelle demande de l'utilisateur.
