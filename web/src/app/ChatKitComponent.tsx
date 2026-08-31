@@ -360,7 +360,25 @@ return (
       )}
     </div>
 
-    {/* error overlay ... (unchanged) */}
+    {error && (
+      <div className="absolute inset-0 z-20 flex items-center justify-center bg-white/95 p-6 text-center backdrop-blur-sm dark:bg-slate-900/95">
+        <div className="max-w-xs space-y-3">
+          <p className="text-sm font-medium text-slate-800 dark:text-slate-100">
+            The chat widget failed to load.
+          </p>
+          <p className="break-words text-xs text-slate-500 dark:text-slate-400">
+            {error}
+          </p>
+          <button
+            type="button"
+            onClick={() => window.location.reload()}
+            className="inline-flex items-center rounded-full bg-slate-900 px-4 py-1.5 text-xs font-medium text-white hover:opacity-90 dark:bg-slate-100 dark:text-slate-900"
+          >
+            Retry
+          </button>
+        </div>
+      </div>
+    )}
   </div>
 )
 
