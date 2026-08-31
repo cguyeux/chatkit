@@ -153,6 +153,7 @@ function ChatKitComponent({
       url: `${process.env.NEXT_PUBLIC_CHATKIT_API_URL ?? "http://127.0.0.1:8000"}/chatkit`,
       domainKey: process.env.NEXT_PUBLIC_CHATKIT_DOMAIN_KEY ?? "localhost",
       fetch: _fetch,
+      uploadStrategy: { type: "two_phase" },
     },
     theme: {
       colorScheme: theme,
@@ -170,12 +171,17 @@ function ChatKitComponent({
           prompt: "What can you do?",
           icon: "circle-question",
         },
+        {
+          label: "Learner guide",
+          prompt: "help",
+          icon: "book-open",
+        },
       ],
     },
     composer: {
       placeholder: "Your Agent is ready!",
       attachments: {
-        enabled: false,
+        enabled: true,
       },
     },
     threadItemActions: {

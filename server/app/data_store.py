@@ -8,14 +8,27 @@ The recommended approach for relational databases is to serialize models into JS
 instead of separating model fields across multiple columns.
 """
 
+import os
+from pathlib import Path
 from typing import Any, Dict, List
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
 from chatkit.store import NotFoundError, Store, AttachmentStore
-from chatkit.types import Attachment, Page, ThreadItem, ThreadMetadata
+from chatkit.types import (
+    Attachment,
+    AttachmentCreateParams,
+    ImageAttachment,
+    Page,
+    ThreadItem,
+    ThreadMetadata,
+)
 
 USER_ID_KEY = "userId"
+APP_DIR = Path(__file__).resolve().parent
+UPLOAD_DIR = APP_DIR / "uploads"
+PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "http://127.0.0.1:8000").rstrip("/")
+MAX_IMAGE_ATTACHMENT_BYTES = int(os.getenv("MAX_IMAGE_ATTACHMENT_BYTES", str(5 * 1024 * 1024)))
 
 
 @dataclass
@@ -29,11 +42,14 @@ class _UserState:
     threads: Dict[str, _ThreadState]
 
 
-class MyDataStore(Store[dict[str, Any]]):
+class MyDataStore(Store[dict[str, Any]], AttachmentStore[dict[str, Any]]):
     """Simple in-memory store compatible with the ChatKit server interface."""
 
     def __init__(self) -> None:
         self._users: Dict[str, _UserState] = {}
+        self._attachments: Dict[str, Attachment] = {}
+        self._attachment_paths: Dict[str, Path] = {}
+        UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
     # ===========================
     # Helpers
@@ -203,27 +219,76 @@ class MyDataStore(Store[dict[str, Any]]):
     # ===========================
     # Attachments
     # ===========================
+    def _attachment_extension(self, name: str, mime_type: str) -> str:
+        suffix = Path(name).suffix.lower()
+        if suffix in {".png", ".jpg", ".jpeg", ".webp", ".gif"}:
+            return suffix
+        return {
+            "image/png": ".png",
+            "image/jpeg": ".jpg",
+            "image/webp": ".webp",
+            "image/gif": ".gif",
+        }.get(mime_type.lower(), ".img")
+
+    async def create_attachment(
+        self,
+        input: AttachmentCreateParams,
+        context: dict[str, Any],
+    ) -> Attachment:
+        if not input.mime_type.lower().startswith("image/"):
+            raise ValueError("Only image attachments are supported for visual tutoring.")
+        if input.size > MAX_IMAGE_ATTACHMENT_BYTES:
+            raise ValueError("Image attachment is too large for visual tutoring.")
+
+        attachment_id = self.generate_attachment_id(input.mime_type, context)
+        ext = self._attachment_extension(input.name, input.mime_type)
+        filename = f"{attachment_id}{ext}"
+        path = UPLOAD_DIR / filename
+        attachment = ImageAttachment(
+            id=attachment_id,
+            name=input.name,
+            mime_type=input.mime_type,
+            upload_url=f"{PUBLIC_BASE_URL}/attachments/{attachment_id}/upload",
+            preview_url=f"{PUBLIC_BASE_URL}/static/uploads/{filename}",
+        )
+        self._attachments[attachment_id] = attachment
+        self._attachment_paths[attachment_id] = path
+        return attachment
+
+    async def upload_attachment_bytes(
+        self,
+        attachment_id: str,
+        content: bytes,
+        content_type: str | None = None,
+    ) -> None:
+        attachment = self._attachments.get(attachment_id)
+        path = self._attachment_paths.get(attachment_id)
+        if attachment is None or path is None:
+            raise NotFoundError(f"Attachment {attachment_id} not found")
+        if len(content) > MAX_IMAGE_ATTACHMENT_BYTES:
+            raise ValueError("Image attachment is too large for visual tutoring.")
+        path.write_bytes(content)
+        self._attachments[attachment_id] = attachment.model_copy(update={"upload_url": None})
+
     async def save_attachment(
         self,
         attachment: Attachment,
         context: dict[str, Any],
     ) -> None:
-        raise NotImplementedError(
-            "MyDataStore does not persist attachments. Provide a Store implementation "
-            "that enforces authentication and authorization before enabling uploads."
-        )
+        self._attachments[attachment.id] = attachment
 
     async def load_attachment(
         self,
         attachment_id: str,
         context: dict[str, Any],
     ) -> Attachment:
-        raise NotImplementedError(
-            "MyDataStore does not load attachments. Provide a Store implementation "
-            "that enforces authentication and authorization before enabling uploads."
-        )
+        attachment = self._attachments.get(attachment_id)
+        if attachment is None:
+            raise NotFoundError(f"Attachment {attachment_id} not found")
+        return attachment.model_copy(update={"upload_url": None})
 
     async def delete_attachment(self, attachment_id: str, context: dict[str, Any]) -> None:
-        raise NotImplementedError(
-            "MyDataStore does not delete attachments because they are never stored."
-        )
+        path = self._attachment_paths.pop(attachment_id, None)
+        self._attachments.pop(attachment_id, None)
+        if path and path.exists():
+            path.unlink()

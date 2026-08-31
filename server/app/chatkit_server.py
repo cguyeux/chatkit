@@ -1,10 +1,13 @@
 # chatkit_server.py
 
 from __future__ import annotations
+import base64
 from datetime import datetime
+from pathlib import Path
 from typing import Any, AsyncIterator
 from pprint import pprint
 import webbrowser  # for local dev only
+from urllib.parse import unquote, urlparse
 
 from agents import TContext  # type variable for context
 from chatkit.agents import AgentContext, ThreadItemConverter
@@ -21,7 +24,9 @@ from chatkit.types import (
     ThreadItem,
     AssistantMessageContent,
     UserMessageItem,
+    ImageAttachment,
 )
+from openai.types.responses import ResponseInputImageParam, ResponseInputTextParam
 from chatkit.store import Store, AttachmentStore
 from chatkit.types import UserMessageItem as CKUserMessageItem, AssistantMessageItem as CKAssistantMessageItem
 # 🔹 Import your multi-agent orchestrator
@@ -32,8 +37,42 @@ from app.widgets.mapwidget import build_map_widget_from_data
 from app.widgets.plotlywidget import build_plotly_widget_from_data
 from app.widgets.radarwidget import build_radar_widget_from_data
 
+class VisualThreadItemConverter(ThreadItemConverter):
+    def _image_url_for_model(self, attachment: ImageAttachment) -> str:
+        url = str(attachment.preview_url)
+        parsed = urlparse(url)
+        marker = "/static/"
+        if marker not in parsed.path:
+            return url
+
+        static_rel = unquote(parsed.path.split(marker, 1)[1]).lstrip("/")
+        app_dir = Path(__file__).resolve().parent
+        path = (app_dir / static_rel).resolve()
+        try:
+            path.relative_to(app_dir.resolve())
+        except ValueError:
+            return url
+        if not path.exists():
+            return url
+
+        encoded = base64.b64encode(path.read_bytes()).decode("ascii")
+        return f"data:{attachment.mime_type};base64,{encoded}"
+
+    async def attachment_to_message_content(self, attachment):
+        if isinstance(attachment, ImageAttachment):
+            return ResponseInputImageParam(
+                type="input_image",
+                image_url=self._image_url_for_model(attachment),
+                detail="auto",
+            )
+        return ResponseInputTextParam(
+            type="input_text",
+            text=f"Unsupported attachment: {attachment.name} ({attachment.mime_type})",
+        )
+
+
 # ChatKit helper for converting thread messages
-converter = ThreadItemConverter()
+converter = VisualThreadItemConverter()
 
 
 

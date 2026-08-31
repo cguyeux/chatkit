@@ -2,6 +2,7 @@
 
 # dependencies
 /node_modules
+**/node_modules/
 /.pnp
 .pnp.*
 .yarn/*
@@ -15,6 +16,7 @@
 
 # next.js
 /.next/
+**/.next/
 /out/
 
 # production
@@ -32,6 +34,17 @@ yarn-error.log*
 
 # env files (can opt-in for committing if needed)
 .env
+.env.*
+
+# Python
+__pycache__/
+**/__pycache__/
+.venv/
+**/.venv/
+
+# Runtime data
+server/app/uploads/
+server/app/evidence_log.jsonl
 
 # vercel
 .vercel

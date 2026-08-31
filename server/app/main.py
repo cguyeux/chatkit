@@ -13,7 +13,10 @@ from app.chatkit_server import MyChatKitServer
 
 app = FastAPI()
 APP_DIR = Path(__file__).resolve().parent
+DOCS_DIR = APP_DIR.parent.parent / "docs"
 app.mount("/static", StaticFiles(directory=str(APP_DIR)), name="static")
+if DOCS_DIR.exists():
+    app.mount("/docs", StaticFiles(directory=str(DOCS_DIR)), name="docs")
 
 # Add CORS to allow our server to be called from local front-end
 app.add_middleware(
@@ -25,7 +28,30 @@ app.add_middleware(
 )
 
 data_store = MyDataStore()
-server = MyChatKitServer(store=data_store)
+server = MyChatKitServer(store=data_store, attachment_store=data_store)
+
+
+@app.api_route("/attachments/{attachment_id}/upload", methods=["PUT", "POST"])
+async def upload_attachment(attachment_id: str, request: Request) -> Response:
+    content_type = request.headers.get("content-type")
+    content: bytes
+    if content_type and content_type.lower().startswith("multipart/form-data"):
+        form = await request.form()
+        content = b""
+        for value in form.values():
+            if hasattr(value, "read") and hasattr(value, "filename"):
+                content = await value.read()
+                content_type = getattr(value, "content_type", None) or content_type
+                break
+        if not content:
+            return JSONResponse(
+                status_code=400,
+                content={"message": "No image file found in multipart upload."},
+            )
+    else:
+        content = await request.body()
+    await data_store.upload_attachment_bytes(attachment_id, content, content_type)
+    return Response(status_code=204)
 
 # forward HTTP requests to the server
 @app.post("/chatkit")
