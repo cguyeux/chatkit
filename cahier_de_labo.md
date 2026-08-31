@@ -152,3 +152,33 @@ corrective nécessaire au-delà du retry.
 **Garde-fous respectés.** Rien poussé sur `origin` (helmi1105) ; clé OpenAI
 jamais affichée ni commitée, uniquement repassée en variable secrète Scaleway
 via `$OPENAI_API_KEY` de l'environnement local.
+
+---
+
+## 2026-08-31 13h15 — Test fonctionnel navigateur v3 : widget invisible, cause externe
+
+**Objectif.** Vérifier le round-trip complet du widget ChatKit en navigateur
+réel (jamais fait lors du déploiement initial du 08/06, faute de Claude-in-Chrome
+connecté à l'époque), sur le frontend `:v3` fraîchement déployé.
+
+**Constat.** Page frontend 200, panneau ChatKit vide (ni écran d'accueil, ni
+message d'erreur visible), une erreur console `Event` non descriptive émise
+par le chunk du SDK ChatKit à chaque chargement.
+
+**Diagnostic.** `read_network_requests` montre le script tiers
+`https://cdn.platform.openai.com/deployments/chatkit/chatkit.js` en **503**
+de façon reproductible (4 tentatives navigateur sur ~5 minutes, rechargements
+espacés). Confirmé hors navigateur : `curl` direct sur ce même script alterne
+`200` / `503` / échec TLS (`unexpected eof`) sur des essais successifs à 2-3s
+d'intervalle. Le frontend (`:v3`) et le backend (`:v3`) répondent correctement
+de leur côté (200 sur `/`, 400 attendu sur `POST /chatkit` sans header) : ce
+n'est PAS une régression du déploiement, c'est une indisponibilité
+intermittente du CDN OpenAI `cdn.platform.openai.com` au moment du test,
+indépendante de notre infrastructure.
+
+**Reste à faire.** Retester plus tard (ou laisser l'utilisateur confirmer)
+quand le CDN OpenAI sera stable. Le défaut déjà noté le 08/06 — état `error`
+du composant ChatKit jamais rendu visuellement (échec silencieux, panneau
+blanc/vide au lieu d'un message clair) — reste d'actualité et aggrave le
+diagnostic pour un futur incident CDN : proposé alors et toujours non fait,
+à la demande.
