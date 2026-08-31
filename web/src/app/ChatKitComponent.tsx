@@ -148,8 +148,10 @@ function ChatKitComponent({
 
   const chatkit = useChatKit({
     api: {
-      url: "http://127.0.0.1:8000/chatkit",
-      domainKey: "localhost",
+      // Backend base URL and ChatKit domainKey are injected at build time
+      // (NEXT_PUBLIC_* are baked into the bundle). Defaults keep local dev working.
+      url: `${process.env.NEXT_PUBLIC_CHATKIT_API_URL ?? "http://127.0.0.1:8000"}/chatkit`,
+      domainKey: process.env.NEXT_PUBLIC_CHATKIT_DOMAIN_KEY ?? "localhost",
       fetch: _fetch,
     },
     theme: {

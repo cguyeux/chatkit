@@ -16,6 +16,9 @@ from app.viz.radar_html import build_radar_dashboard_html
 # CONFIG
 # ===================================================== VECTOR_STORE_ID vs_6a1d49343a688191a1a714ca3dafc3d8  
 VECTOR_STORE_ID = os.getenv("VECTOR_STORE_ID", "vs_6a116b3869e08191aa26f247b322a8c1")
+# Public base URL of THIS backend (used to build absolute links to /static PDFs).
+# Overridden at deploy time with the container's public endpoint.
+PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "http://127.0.0.1:8000").rstrip("/")
 KC_GRAPH_PATH = os.getenv("KC_GRAPH_PATH", os.path.join(os.path.dirname(__file__), "kc_graph1.json"))
 
 DIAGNOSTIC_Q_NUM = int(os.getenv("DIAGNOSTIC_Q_NUM", "8"))# global diagnostic length
@@ -889,7 +892,7 @@ Details:
 
         first_page = pages[0]
         pdf_name = self.graph.source_pdf or "Charte graphique 2025 - Impression.pdf"
-        pdf_url = f"http://127.0.0.1:8000/static/{quote(pdf_name)}#page={first_page}"
+        pdf_url = f"{PUBLIC_BASE_URL}/static/{quote(pdf_name)}#page={first_page}"
         html = ""
 
         return {
