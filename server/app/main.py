@@ -8,7 +8,7 @@ from fastapi.staticfiles import StaticFiles
 from starlette.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.data_store import USER_ID_KEY, MyDataStore
+from app.data_store import USER_ID_KEY, MyDataStore, MAX_IMAGE_ATTACHMENT_BYTES
 from app.chatkit_server import MyChatKitServer
 
 app = FastAPI()
@@ -33,6 +33,27 @@ server = MyChatKitServer(store=data_store, attachment_store=data_store)
 
 @app.api_route("/attachments/{attachment_id}/upload", methods=["PUT", "POST"])
 async def upload_attachment(attachment_id: str, request: Request) -> Response:
+    # Garde anti-DoS : rejeter sur la taille ANNONCEE avant de lire le corps.
+    # Sans cela, `await request.body()` / `request.form()` bufferisent tout le
+    # fichier en memoire avant que la limite applicative (verifiee plus bas dans
+    # upload_attachment_bytes) ne s'applique, ce qui permet a une requete non
+    # authentifiee de ~150 Mo de faire tomber le container (OOM). Mesure P57.7,
+    # 2026-09-05 : plancher entre 50 et 150 Mo pour 238 Mio de RAM.
+    # On tolere une marge pour l'overhead d'encodage multipart.
+    max_request_bytes = MAX_IMAGE_ATTACHMENT_BYTES + 1 * 1024 * 1024
+    declared = request.headers.get("content-length")
+    if declared is not None:
+        try:
+            if int(declared) > max_request_bytes:
+                return JSONResponse(
+                    status_code=413,
+                    content={"message": "Upload too large."},
+                )
+        except ValueError:
+            return JSONResponse(
+                status_code=400,
+                content={"message": "Invalid Content-Length."},
+            )
     content_type = request.headers.get("content-type")
     content: bytes
     if content_type and content_type.lower().startswith("multipart/form-data"):
@@ -49,7 +70,20 @@ async def upload_attachment(attachment_id: str, request: Request) -> Response:
                 content={"message": "No image file found in multipart upload."},
             )
     else:
-        content = await request.body()
+        # Lecture PLAFONNEE en flux plutot que `await request.body()`, qui
+        # bufferise tout sans borne : couvre le cas d'un corps `chunked` sans
+        # Content-Length, qui echapperait a la garde ci-dessus.
+        chunks: list[bytes] = []
+        total = 0
+        async for chunk in request.stream():
+            total += len(chunk)
+            if total > max_request_bytes:
+                return JSONResponse(
+                    status_code=413,
+                    content={"message": "Upload too large."},
+                )
+            chunks.append(chunk)
+        content = b"".join(chunks)
     await data_store.upload_attachment_bytes(attachment_id, content, content_type)
     return Response(status_code=204)
 
