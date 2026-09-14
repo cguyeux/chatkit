@@ -266,6 +266,27 @@ transition en conditions réelles (nécessiterait un vrai appel OpenAI) ; la
 logique de garde (`peek_transition_message`) a été relue pour miroir exact
 des conditions de `handle()`, pas exécutée en bout en bout.
 
-**Non fait.** Build/push/déploiement Scaleway des deux images (`api` pour
-les correctifs Python, `web` pour le bouton d'aide) : en attente de
-décision de l'utilisateur.
+**Décision utilisateur (sondage).** Committer + pousser sur `fork` puis
+déployer immédiatement les deux conteneurs (option recommandée retenue).
+
+**Git.** Commit `823cd20` (« feat(ux): transition avant génération lente +
+bouton d'aide et doc en ligne »), poussé sur `fork` (`18204e4..823cd20`).
+
+**Déploiement.** Garde-fou forcé une nouvelle fois (T03364, même motif que
+les précédents). `api` -> `:v6` (pas de `--build-arg`, `COPY app` inchangé),
+`web` -> `:v8` (mêmes `--build-arg` qu'en v7). Build+push des deux images,
+`scw container container update` sur les deux conteneurs (re-passage de
+`OPENAI_API_KEY` pour `api`), attente `ready` (~30-35s chacun).
+
+**Vérification navigateur réel (agent-browser, site public
+`formation.gclab.fr`).** Chat toujours fonctionnel après redéploiement
+backend (pas d'erreur de chargement). Bouton « ? » présent, menu ouvert,
+`href` du lien documentation confirmé pointer vers le vrai backend public
+(`.../static/guide_fr.html`), requête `curl` directe : `HTTP 200`. **Non
+vérifié** : le texte de transition lui-même, qui n'apparaît qu'au premier
+vrai `start diagnostic`/`practice`/`next` (coût API OpenAI réel) — décision
+prise en amont avec l'utilisateur de ne pas déclencher cet appel pour ce
+test, comme à chaque déploiement précédent de ce projet.
+
+**Dette documentaire corrigée.** `DEPLOY_SCALEWAY.md` : images `api`
+`:v5` -> `:v6`, `web` `:v7` -> `:v8`.
