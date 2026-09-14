@@ -17,7 +17,7 @@ message (coût par requête). Endpoint public = dépense ouverte sur la clé uti
 | Container frontend | `web` (id `01416308-9185-4fa2-b1fd-cc432053d997`), port 8080 |
 | Backend URL | https://chatkitf92c84e6-api.functions.fnc.fr-par.scw.cloud |
 | Frontend URL (public) | https://chatkitf92c84e6-web.functions.fnc.fr-par.scw.cloud |
-| Images | `rg.fr-par.scw.cloud/chatkit/api:v1`, `rg.fr-par.scw.cloud/chatkit/web:v5` (versions divergentes, la doc n'avait pas suivi les updates intermédiaires) |
+| Images | `rg.fr-par.scw.cloud/chatkit/api:v5`, `rg.fr-par.scw.cloud/chatkit/web:v5` |
 
 ## Configuration / variables
 

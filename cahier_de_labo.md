@@ -260,3 +260,32 @@ configuration de déploiement.
 **Dette documentaire corrigée.** `DEPLOY_SCALEWAY.md` indiquait encore l'image
 `web:v1` et le placeholder `localhost` alors que le déploiement réel en était
 à `:v4` : mis à jour pour refléter `:v5` et la vraie clé.
+
+---
+
+## 2026-09-14 17h45 — Correction d'accent (contenu pédagogique) ; backend redéployé en v5
+
+**Relecture demandée.** L'utilisateur signale des fautes de français/accent
+après le premier test réussi. Audit complet du dépôt (code, widgets, guide
+`docs/learner_guide.md`, données pédagogiques) : une seule anomalie trouvée,
+`OPERATIONNELLE` sans accent dans deux titres de KC
+(« CARTOGRAPHIE OPÉRATIONNELLE - exemple feu urbain/forêt », `g_k31`/`g_k32`),
+présente dans `server/app/kc_graph1.json` (le fichier réellement chargé par
+`orchestrator.py`, `KC_GRAPH_PATH`) et sa copie `gold_ecg_annotation_v1.json`
+(non utilisée par le code mais corrigée par cohérence).
+
+**Correctif + déploiement.** Correction directe dans les deux JSON. Commit
+`d9e84ca`. Rebuild `api` -> `:v5` (pas de `--build-arg`, juste `COPY app`),
+push registre, `scw container container update` (avec re-passage de
+`SecretEnvironmentVariables.OPENAI_API_KEY`, cf. piège déjà documenté) +
+attente `ready` (~40s). Vérification navigateur réelle : frontend/chat
+toujours fonctionnels après redéploiement backend (écran d'accueil ChatKit
+inchangé). Contenu corrigé non re-testé en bout en bout via le flux complet
+diagnostic -> QCM (aurait consommé l'API OpenAI sans ajouter de certitude :
+correction statique d'un fichier de données, déjà validée par relecture
+JSON complète).
+
+**Git.** Push sur `fork` (cguyeux) : `0210a26..d9e84ca`. `origin` (Helmi)
+non touché, comme toujours ; Helmi informé par mail pour qu'il intègre ces
+modifications (garde anti-DoS + config env-driven + correctif d'accent) de
+son côté s'il le souhaite.
