@@ -26,6 +26,7 @@ function ChatKitComponent({
   const [mapState, setMapState] = useState<MapState>(null)
   const [plotHtml, setPlotHtml] = useState<string | null>(null) // plot HTML
   const [pdfUrl, setPdfUrl] = useState<string | null>(null)
+  const [showIntro, setShowIntro] = useState(true)
 
   // --- script availability effect (unchanged) ---
   useEffect(() => {
@@ -159,27 +160,27 @@ function ChatKitComponent({
       colorScheme: theme,
     },
     startScreen: {
-      greeting: "Hey, what can I do for you?",
+      greeting: "Bonjour. Choisissez une suggestion pour commencer, ou tapez directement votre question.",
       prompts: [
         {
-          label: "Hello!",
-          prompt: "Hello!",
+          label: "Démarrer le diagnostic",
+          prompt: "start diagnostic",
           icon: "star-filled",
         },
         {
-          label: "What can you do?",
-          prompt: "What can you do?",
-          icon: "circle-question",
+          label: "Voir ma progression",
+          prompt: "radar",
+          icon: "chart",
         },
         {
-          label: "Learner guide",
-          prompt: "help",
+          label: "Aide et commandes",
+          prompt: "aide",
           icon: "book-open",
         },
       ],
     },
     composer: {
-      placeholder: "Your Agent is ready!",
+      placeholder: "Tapez votre message (ex : start diagnostic, radar, aide)",
       attachments: {
         enabled: true,
       },
@@ -248,6 +249,7 @@ function ChatKitComponent({
     },
     onResponseStart: () => {
       setError(null)
+      setShowIntro(false)
     },
     onThreadLoadStart: (event) => {
       console.log("Thread load started: ", event.threadId)
@@ -284,11 +286,44 @@ function ChatKitComponent({
 
 return (
   <div
-    className={`relative h-full rounded-2xl overflow-hidden bg-white shadow-sm dark:bg-slate-900 ${
+    className={`relative h-full rounded-2xl overflow-hidden bg-white shadow-sm dark:bg-slate-900 flex flex-col ${
       maximize ? "w-full" : "w-80 ml-auto"
     }`}
   >
-    <div className="flex h-full w-full">
+    {showIntro && (
+      <div className="shrink-0 m-3 mb-0 rounded-xl border border-slate-200 bg-slate-50 p-4 dark:border-slate-700 dark:bg-slate-800/60">
+        <div className="flex items-start justify-between gap-3">
+          <h1 className="text-sm font-semibold text-slate-900 dark:text-slate-100">
+            Formateur intelligent : cartographie opérationnelle
+          </h1>
+          <button
+            type="button"
+            aria-label="Masquer"
+            onClick={() => setShowIntro(false)}
+            className="shrink-0 rounded-full px-2 text-slate-400 hover:text-slate-700 dark:hover:text-slate-200"
+          >
+            ×
+          </button>
+        </div>
+        <p className="mt-1 text-xs leading-relaxed text-slate-600 dark:text-slate-300">
+          Cet assistant fait réviser le mémento officiel gestion opérationnelle et commandement
+          (formes, couleurs, symboles) avec des questions qui s&apos;adaptent à votre niveau, des
+          indices personnalisés en cas d&apos;erreur, la reconnaissance de symboles à partir
+          d&apos;une photo, et un suivi de votre progression module par module.
+        </p>
+        <button
+          type="button"
+          onClick={() => {
+            setShowIntro(false)
+            chatkit.sendUserMessage({ text: "start diagnostic" })
+          }}
+          className="mt-3 rounded-lg bg-slate-900 px-3 py-1.5 text-xs font-semibold text-white hover:bg-slate-800 dark:bg-slate-100 dark:text-slate-900 dark:hover:bg-slate-200"
+        >
+          Démarrer le diagnostic
+        </button>
+      </div>
+    )}
+    <div className="flex flex-1 w-full min-h-0">
       <div className={showRightPane ? "w-1/2 border-r border-slate-200" : "w-full"}>
         <ChatKit control={chatkit.control} className="block h-full w-full" />
       </div>
@@ -298,11 +333,11 @@ return (
           {/* Header */}
           <div className="shrink-0 flex items-center justify-between px-2 py-1 text-xs text-slate-600 dark:text-slate-300">
             <span>
-              {hasPdf && "PDF source"}
-              {hasPlot && "Plotly chart"}
+              {hasPdf && "Source PDF"}
+              {hasPlot && "Graphique"}
               {!hasPlot && hasMap && mapState && (
                 <>
-                  Map: {mapState.lat.toFixed(4)}, {mapState.lng.toFixed(4)} (z={mapState.zoom})
+                  Carte : {mapState.lat.toFixed(4)}, {mapState.lng.toFixed(4)} (zoom {mapState.zoom})
                 </>
               )}
             </span>
@@ -328,7 +363,7 @@ return (
               }}
             >
               <span className="text-[13px] leading-none">×</span>
-              <span>Close</span>
+              <span>Fermer</span>
             </button>
           </div>
 
@@ -364,7 +399,7 @@ return (
       <div className="absolute inset-0 z-20 flex items-center justify-center bg-white/95 p-6 text-center backdrop-blur-sm dark:bg-slate-900/95">
         <div className="max-w-xs space-y-3">
           <p className="text-sm font-medium text-slate-800 dark:text-slate-100">
-            The chat widget failed to load.
+            Le chat n&apos;a pas pu se charger.
           </p>
           <p className="break-words text-xs text-slate-500 dark:text-slate-400">
             {error}
@@ -374,7 +409,7 @@ return (
             onClick={() => window.location.reload()}
             className="inline-flex items-center rounded-full bg-slate-900 px-4 py-1.5 text-xs font-medium text-white hover:opacity-90 dark:bg-slate-100 dark:text-slate-900"
           >
-            Retry
+            Réessayer
           </button>
         </div>
       </div>

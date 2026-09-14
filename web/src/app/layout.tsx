@@ -3,8 +3,8 @@ import "./globals.css"
 import Script from "next/script"
 
 export const metadata: Metadata = {
-    title: "AgentKit demo",
-    description: "Demo of ChatKit with hosted workflow",
+    title: "Formateur cartographie opérationnelle",
+    description: "Assistant de formation sur le mémento gestion opérationnelle et commandement",
 }
 
 
@@ -14,7 +14,7 @@ export default function RootLayout({
     children: React.ReactNode
 }>) {
     return (
-        <html lang="en">
+        <html lang="fr">
             <head>
                 <Script
                     src="https://cdn.platform.openai.com/deployments/chatkit/chatkit.js"

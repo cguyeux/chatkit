@@ -58,19 +58,10 @@ export default function Home() {
                     <button
                         type="button"
                         className="rounded-lg bg-slate-900 px-4 py-2 text-sm font-semibold text-white hover:bg-slate-800 dark:bg-slate-100 dark:text-slate-900 dark:hover:bg-slate-200 max-w-fit pointer-events-auto"
-                        onClick={() => {
-                            window.open("http://127.0.0.1:8000/docs/learner_guide.md", "_blank", "noopener,noreferrer")
-                        }}>
-                        Learner Guide
-                    </button>
-
-                    <button
-                        type="button"
-                        className="rounded-lg bg-slate-900 px-4 py-2 text-sm font-semibold text-white hover:bg-slate-800 dark:bg-slate-100 dark:text-slate-900 dark:hover:bg-slate-200 max-w-fit pointer-events-auto"
                         onClick={() => setMax((v) => {
                             return !v
                         })}>
-                        {maximize ? "Right Pane" : "Maximize"}
+                        {maximize ? "Vue partagée" : "Plein écran"}
                     </button>
 
                     <button
@@ -79,7 +70,7 @@ export default function Home() {
                         onClick={() => setTheme((v) => {
                             return v === "dark" ? "light" : "dark"
                         })}>
-                        {theme === "dark" ? "Use Light" : "Use Dark"}
+                        {theme === "dark" ? "Mode clair" : "Mode sombre"}
                     </button>
                 </div>
                 {
