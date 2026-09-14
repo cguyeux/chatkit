@@ -1,0 +1,185 @@
+<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Guide d'utilisation — Formateur cartographie opérationnelle</title>
+<style>
+  :root {
+    --bg: #f1f5f9;
+    --panel: #ffffff;
+    --text: #0f172a;
+    --muted: #475569;
+    --border: #e2e8f0;
+    --chip-bg: #0f172a;
+    --chip-text: #f8fafc;
+    --accent: #0f172a;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #020617;
+      --panel: #0f172a;
+      --text: #f1f5f9;
+      --muted: #94a3b8;
+      --border: #1e293b;
+      --chip-bg: #f1f5f9;
+      --chip-text: #0f172a;
+      --accent: #f1f5f9;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    line-height: 1.55;
+  }
+  .wrap {
+    max-width: 720px;
+    margin: 0 auto;
+    padding: 32px 20px 64px;
+  }
+  header {
+    margin-bottom: 28px;
+  }
+  h1 {
+    font-size: 1.5rem;
+    margin: 0 0 6px;
+  }
+  header p {
+    color: var(--muted);
+    margin: 0;
+    font-size: 0.95rem;
+  }
+  section {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 14px;
+    padding: 18px 20px;
+    margin-bottom: 16px;
+  }
+  h2 {
+    font-size: 1.05rem;
+    margin: 0 0 10px;
+  }
+  ol, ul {
+    margin: 0;
+    padding-left: 1.2em;
+  }
+  li { margin-bottom: 6px; }
+  li:last-child { margin-bottom: 0; }
+  p { margin: 0 0 10px; }
+  p:last-child { margin-bottom: 0; }
+  code {
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    background: var(--chip-bg);
+    color: var(--chip-text);
+    padding: 1px 7px;
+    border-radius: 999px;
+    font-size: 0.85em;
+    white-space: nowrap;
+  }
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 0.92rem;
+  }
+  td {
+    padding: 6px 0;
+    border-bottom: 1px solid var(--border);
+    vertical-align: top;
+  }
+  td:first-child { white-space: nowrap; padding-right: 14px; }
+  tr:last-child td { border-bottom: none; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>Guide d'utilisation</h1>
+    <p>Formateur intelligent : cartographie opérationnelle — mémento officiel gestion opérationnelle et commandement.</p>
+  </header>
+
+  <section>
+    <h2>Ce que fait cet outil</h2>
+    <ul>
+      <li>estimer votre niveau avec un diagnostic à choix multiples ;</li>
+      <li>enseigner une notion à la fois, avec une mini-leçon ;</li>
+      <li>répondre à vos questions pendant la leçon ;</li>
+      <li>générer des quiz d'entraînement adaptés à votre niveau ;</li>
+      <li>expliquer vos erreurs et donner des indices progressifs ;</li>
+      <li>suivre votre progression, notion par notion ;</li>
+      <li>identifier un symbole à partir d'une photo.</li>
+    </ul>
+  </section>
+
+  <section>
+    <h2>Comment démarrer</h2>
+    <p>Tapez <code>start diagnostic</code>, ou cliquez sur le bouton correspondant. Le diagnostic estime votre niveau sur plusieurs notions ; il ne valide rien en soi, la validation se fait ensuite par les quiz d'entraînement.</p>
+  </section>
+
+  <section>
+    <h2>Déroulé conseillé</h2>
+    <ol>
+      <li>Tapez <code>start diagnostic</code> pour démarrer l'estimation de niveau.</li>
+      <li>Répondez au QCM diagnostic (juste une estimation, pas une notation).</li>
+      <li>Lisez la mini-leçon proposée pour la notion la plus faible.</li>
+      <li>Posez une question si quelque chose n'est pas clair.</li>
+      <li>Tapez <code>practice</code> pour lancer un quiz adapté à cette notion.</li>
+      <li>En cas d'erreur, lisez le retour puis tapez <code>hint</code> pour un indice progressif.</li>
+      <li>Refaites <code>practice</code> jusqu'à validation.</li>
+      <li>Une fois la notion validée, tapez <code>next</code> pour passer à la suivante.</li>
+      <li>Tapez <code>radar</code> à tout moment pour voir votre progression.</li>
+    </ol>
+  </section>
+
+  <section>
+    <h2>Commandes</h2>
+    <table>
+      <tr><td><code>start diagnostic</code></td><td>démarrer le diagnostic global.</td></tr>
+      <tr><td><code>practice</code></td><td>générer un quiz adapté à la notion en cours.</td></tr>
+      <tr><td><code>hint</code></td><td>obtenir l'indice suivant après une erreur.</td></tr>
+      <tr><td><code>next</code></td><td>passer à la notion suivante après validation.</td></tr>
+      <tr><td><code>radar</code></td><td>afficher la progression par notion et par module.</td></tr>
+      <tr><td><code>aide</code></td><td>réafficher ce guide directement dans le chat.</td></tr>
+      <tr><td><code>clear image</code></td><td>oublier la photo de symbole active.</td></tr>
+    </table>
+  </section>
+
+  <section>
+    <h2>Répondre à un QCM</h2>
+    <p>Répondez directement dans le quiz affiché, ou tapez vos réponses dans le chat, par exemple :</p>
+    <p><code>1A 2C 3B 4D</code></p>
+  </section>
+
+  <section>
+    <h2>Poser une question pendant la leçon</h2>
+    <p>Pendant une mini-leçon, vous pouvez poser des questions de clarification, par exemple « pourquoi le bleu est-il lié à l'eau ? ». Les réponses restent centrées sur la notion en cours et les précédentes, pour garder un parcours cohérent.</p>
+  </section>
+
+  <section>
+    <h2>Envoyer une photo de symbole</h2>
+    <p>Joignez une photo d'un symbole et demandez ce qu'il signifie. L'assistant analyse la forme, la couleur, le contour, le texte et le pictogramme visibles, à partir du mémento officiel.</p>
+    <p>Vous pouvez ensuite poser des questions de suivi sur la même image (« et la couleur ? », « pourquoi orange ? ») sans la renvoyer. Pour repartir d'une image neuve, tapez <code>clear image</code>.</p>
+  </section>
+
+  <section>
+    <h2>Suivi de progression</h2>
+    <p>Tapez <code>radar</code> pour un graphique de votre progression par notion et par module, construit à partir de vos quiz d'entraînement, pas seulement du diagnostic initial.</p>
+  </section>
+
+  <section>
+    <h2>Points importants</h2>
+    <ul>
+      <li>Le diagnostic est seulement une estimation de niveau.</li>
+      <li>Les quiz d'entraînement valident la maîtrise d'une notion.</li>
+      <li>Il faut valider la notion en cours avant de passer à la suivante.</li>
+      <li>Un contrôle de module peut apparaître avant de continuer.</li>
+      <li>Une question hors du champ du cours peut être refusée ou réorientée.</li>
+      <li>Si une photo n'est pas assez nette, une photo plus claire peut être demandée.</li>
+    </ul>
+  </section>
+</div>
+</body>
+</html>

@@ -30,7 +30,7 @@ from openai.types.responses import ResponseInputImageParam, ResponseInputTextPar
 from chatkit.store import Store, AttachmentStore
 from chatkit.types import UserMessageItem as CKUserMessageItem, AssistantMessageItem as CKAssistantMessageItem
 # 🔹 Import your multi-agent orchestrator
-from app.orchestrator import Orchestrator
+from app.orchestrator import Orchestrator, extract_latest_user_text
 from app.widgets.qcmwidget import build_qcm_widget_from_data
 from app.widgets.studywidget import build_study_widget_from_data
 from app.widgets.mapwidget import build_map_widget_from_data   
@@ -116,6 +116,22 @@ class MyChatKitServer(ChatKitServer[dict[str, Any]]):
 
         # 2) Convert to input_items for Agents SDK
         input_items = await converter.to_agent_input(items)
+
+        # 2bis) Announce the wait before slow LLM-backed generation (diagnostic,
+        # practice QCM, next micro-lesson) starts, so the user isn't left
+        # looking at a silent spinner before content abruptly appears.
+        transition_text = self.orch.peek_transition_message(
+            agent_context, extract_latest_user_text(input_items)
+        )
+        if transition_text:
+            yield ThreadItemDoneEvent(
+                item=AssistantMessageItem(
+                    thread_id=thread.id,
+                    id=self.store.generate_item_id("message", thread, context),
+                    created_at=datetime.now(),
+                    content=[AssistantMessageContent(text=transition_text)],
+                )
+            )
 
         # 3) Call your orchestrator with input_items instead of plain string
         try:

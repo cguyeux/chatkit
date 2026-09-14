@@ -29,6 +29,9 @@ function ChatKitComponent({
   const [pdfUrl, setPdfUrl] = useState<string | null>(null)
   const [showTour, setShowTour] = useState(true)
   const [tourStep, setTourStep] = useState(0)
+  const [showHelpMenu, setShowHelpMenu] = useState(false)
+
+  const docsUrl = `${process.env.NEXT_PUBLIC_CHATKIT_API_URL ?? "http://127.0.0.1:8000"}/static/guide_fr.html`
 
   // --- script availability effect (unchanged) ---
   useEffect(() => {
@@ -316,6 +319,43 @@ return (
         🧭 Visite guidée
       </button>
     )}
+
+    <div className="absolute right-3 top-3 z-30">
+      <button
+        type="button"
+        aria-label="Aide"
+        aria-expanded={showHelpMenu}
+        onClick={() => setShowHelpMenu((v) => !v)}
+        className="flex h-6 w-6 items-center justify-center rounded-full bg-slate-900/90 text-[11px] font-semibold text-slate-50 shadow-sm ring-1 ring-slate-700/70 hover:bg-slate-900 dark:bg-slate-800/90 dark:text-slate-100 dark:ring-slate-600/70"
+      >
+        ?
+      </button>
+      {showHelpMenu && (
+        <div className="absolute right-0 mt-1.5 w-52 rounded-xl border border-slate-200 bg-white p-1.5 text-xs shadow-lg dark:border-slate-700 dark:bg-slate-800">
+          <button
+            type="button"
+            onClick={() => {
+              setShowHelpMenu(false)
+              setTourStep(0)
+              setShowTour(true)
+            }}
+            className="block w-full rounded-lg px-2.5 py-1.5 text-left text-slate-700 hover:bg-slate-100 dark:text-slate-200 dark:hover:bg-slate-700"
+          >
+            🧭 Revoir la visite guidée
+          </button>
+          <a
+            href={docsUrl}
+            target="_blank"
+            rel="noopener noreferrer"
+            onClick={() => setShowHelpMenu(false)}
+            className="block w-full rounded-lg px-2.5 py-1.5 text-left text-slate-700 hover:bg-slate-100 dark:text-slate-200 dark:hover:bg-slate-700"
+          >
+            📄 Documentation complète
+          </a>
+        </div>
+      )}
+    </div>
+
     <div className="flex flex-1 w-full min-h-0">
       <div className={showRightPane ? "w-1/2 border-r border-slate-200" : "w-full"}>
         <ChatKit control={chatkit.control} className="block h-full w-full" />

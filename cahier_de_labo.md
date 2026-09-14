@@ -200,3 +200,72 @@ l'aperçu local. Session fermée après capture.
 
 **Dette documentaire corrigée.** `DEPLOY_SCALEWAY.md` : image `web`
 `:v6` -> `:v7`.
+
+---
+
+## 2026-09-14 18h27 — Transition avant génération lente ; bouton d'aide (?) + documentation en ligne
+
+**Signalement.** L'utilisateur, après avoir testé le tour guidé : « ensuite on
+enchaine sur du moulinage, puis un qcm à remplir : il manque de la
+transition. Aussi, il faudrait un (?) qui pointe vers un tutorial et une doc
+en ligne. »
+
+**Diagnostic.** Trois déclencheurs (`start diagnostic`, `practice`, `next`)
+appellent chacun un ou plusieurs LLM côté backend (`_start_diagnostic`,
+`_start_practice`, `_next_kc_micro_lesson` dans `orchestrator.py`) puis
+retournent directement un widget QCM ou une leçon, sans aucun message
+intermédiaire : l'utilisateur voit un silence (spinner générique ChatKit)
+puis un contenu qui « tombe du ciel ». Découverte annexe : le bouton
+« Learner Guide » cassé de la v6 (déjà retiré) pointait vers un mount
+`/docs` (`main.py`) qui n'est en réalité jamais actif en production — le
+`Dockerfile` backend ne copie que `app/`, pas le répertoire `docs/` du dépôt
+(`DOCS_DIR = APP_DIR.parent.parent / "docs"` ne résout donc rien dans
+l'image). Le mount `/static` (`StaticFiles(directory=APP_DIR)`), lui,
+fonctionne réellement en production (déjà prouvé par le PDF de doctrine
+servi depuis `server/app/`) : c'est ce mount qu'il fallait réutiliser plutôt
+que réparer le mount mort.
+
+**Correctifs (`server/app/orchestrator.py`, `server/app/chatkit_server.py`).**
+Constantes `START_DIAGNOSTIC_TRIGGERS`/`PRACTICE_TRIGGERS`/`NEXT_KC_TRIGGERS`
+extraites (source unique, réutilisées dans `handle()`). Nouvelle méthode
+`Orchestrator.peek_transition_message(ctx, text)` : relit les mêmes
+pré-conditions que `handle()` (KC courant défini, portillon de pratique
+validé, module non verrouillé) SANS déclencher la génération, et renvoie un
+court texte de transition uniquement quand la branche lente va réellement
+s'exécuter (pour éviter l'incohérence « je prépare... » suivi d'un
+avertissement de blocage). `chatkit_server.respond()` appelle ce helper
+juste avant `orch.handle()` et, si un texte est renvoyé, l'émet en premier
+message (`yield` immédiat), donc visible avant le `moulinage`, plutôt
+qu'après.
+
+**Documentation en ligne (`server/app/guide_fr.html`).** Traduction et mise
+en forme de `docs/learner_guide.md` (resté en anglais, jamais lié) en page
+HTML autonome française, palette claire/sombre alignée sur l'app
+(`prefers-color-scheme`), servie via le mount `/static` déjà fonctionnel en
+production (`<backend>/static/guide_fr.html`). Reprend le déroulé conseillé,
+les commandes, la réponse aux QCM, l'envoi de photo de symbole, le suivi de
+progression.
+
+**UI (`web/src/app/ChatKitComponent.tsx`, `GuidedTour.tsx`).** Bouton rond
+« ? » toujours visible (`z-30`, au-dessus du tour et de l'overlay d'erreur),
+ouvre un petit menu à deux entrées : « Revoir la visite guidée » (rouvre
+`GuidedTour`) et « Documentation complète » (lien externe vers
+`${NEXT_PUBLIC_CHATKIT_API_URL}/static/guide_fr.html`, nouvel onglet).
+Dernière étape du tour mise à jour pour mentionner ce bouton.
+
+**Validation avant déploiement.** `python3 -m py_compile` propre sur les deux
+fichiers backend (le venv local `server/.venv` s'est révélé vide/cassé,
+aucun paquet installé — non réparé, hors périmètre, la vraie validation des
+dépendances se fait par le build Docker). `npx tsc --noEmit` et `next build`
+propres côté frontend. `next start` local (port 3902) + `agent-browser` :
+bouton « ? » et menu vérifiés (snapshot + capture), `href` du lien
+documentation confirmé pointer vers `.../static/guide_fr.html`. Page
+`guide_fr.html` ouverte en `file://` direct : rendu clair et sombre tous
+deux vérifiés par capture d'écran. Pas de vérification du texte de
+transition en conditions réelles (nécessiterait un vrai appel OpenAI) ; la
+logique de garde (`peek_transition_message`) a été relue pour miroir exact
+des conditions de `handle()`, pas exécutée en bout en bout.
+
+**Non fait.** Build/push/déploiement Scaleway des deux images (`api` pour
+les correctifs Python, `web` pour le bouton d'aide) : en attente de
+décision de l'utilisateur.

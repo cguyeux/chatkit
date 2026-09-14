@@ -41,6 +41,13 @@ EVIDENCE_LOG_PATH = os.getenv(
 QCM_PROMPT_MAX_CHARS = int(os.getenv("QCM_PROMPT_MAX_CHARS", "240"))
 QCM_CHOICE_MAX_CHARS = int(os.getenv("QCM_CHOICE_MAX_CHARS", "90"))
 
+# Trigger phrases for the three slow, LLM-backed content-generation actions.
+# Shared between handle()'s dispatch and Orchestrator.peek_transition_message(),
+# which announces the wait before the generation actually starts.
+START_DIAGNOSTIC_TRIGGERS = {"start diagnostic", "diagnostic", "start"}
+PRACTICE_TRIGGERS = {"practice", "practice qcm", "qcm"}
+NEXT_KC_TRIGGERS = {"next", "next kc", "continue"}
+
 # =====================================================
 # HELPERS (extract latest user message text)
 # =====================================================
@@ -2163,16 +2170,16 @@ Details:
             return self._help_text()
 
         # ---- start diagnostic
-        if low in {"start diagnostic", "diagnostic", "start"}:
+        if low in START_DIAGNOSTIC_TRIGGERS:
             return await self._start_diagnostic(sess, ctx)
 
         # ---- practice on current weakness
-        if low in {"practice", "practice qcm", "qcm"}:
+        if low in PRACTICE_TRIGGERS:
             if not sess.current_kc_id:
                 return "⚠️ No weakness KC selected yet. Type: start diagnostic"
             return await self._start_practice(sess, ctx)
         # ---- go to next KC and show micro-lesson
-        if low in {"next", "next kc", "continue"}:
+        if low in NEXT_KC_TRIGGERS:
             if not sess.current_kc_id:
                 return "⚠️ No current KC. Type: start diagnostic"
             return await self._next_kc_micro_lesson(sess, ctx)
@@ -2234,6 +2241,35 @@ Details:
 
         # ---- default help
         return self._help_text()
+
+    def peek_transition_message(self, ctx: AgentContext, raw_text: str) -> Optional[str]:
+        """
+        Read-only precondition check mirroring the guards inside handle()'s
+        dispatch, so the caller can announce a wait ONLY when the matching
+        slow (LLM-backed) branch will actually run. Never mutates session
+        state or triggers generation itself.
+        """
+        low = (raw_text or "").strip().lower()
+        sess = self._get_sess(ctx)
+
+        if low in START_DIAGNOSTIC_TRIGGERS:
+            return "🎯 Je prépare un diagnostic de 8 questions pour estimer votre niveau. Un instant..."
+
+        if low in PRACTICE_TRIGGERS:
+            if not sess.current_kc_id:
+                return None
+            return "📝 Je prépare un quiz adapté à cette notion. Un instant..."
+
+        if low in NEXT_KC_TRIGGERS:
+            if not sess.current_kc_id:
+                return None
+            if not sess.can_advance or sess.validated_kc_id != sess.current_kc_id:
+                return None
+            if sess.module_gate_locked:
+                return None
+            return "📘 Je prépare la leçon suivante. Un instant..."
+
+        return None
 
     # =====================================================
     # INTERNAL STEPS

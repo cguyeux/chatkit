@@ -35,7 +35,7 @@ const TOUR_STEPS: TourStep[] = [
   {
     emoji: "📊",
     title: "5. Votre progression en un coup d'œil",
-    body: "Tapez « radar » à tout moment pour voir un graphique de votre progression par thème. Bloqué ? Tapez « aide » pour revoir la marche à suivre.",
+    body: "Tapez « radar » à tout moment pour voir un graphique de votre progression par thème. Bloqué ? Tapez « aide », ou cliquez sur le (?) en haut à droite pour revoir cette visite ou ouvrir la documentation complète.",
   },
 ]
 
