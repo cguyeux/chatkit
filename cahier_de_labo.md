@@ -289,3 +289,62 @@ JSON complète).
 non touché, comme toujours ; Helmi informé par mail pour qu'il intègre ces
 modifications (garde anti-DoS + config env-driven + correctif d'accent) de
 son côté s'il le souhaite.
+
+---
+
+## 2026-09-14 18h05 — Accueil francisé pour les pompiers ; frontend v6
+
+**Signalement.** L'utilisateur : « ils cliquent, ils comprennent rien ni à
+ce que cela fait, ni à sa puissance, ils partent ». Audit de l'accueil réel :
+`lang="en"`, titre d'onglet « AgentKit demo », greeting ChatKit « Hey, what
+can I do for you? », suggestions génériques (« Hello! », « What can you
+do? »), bouton « Learner Guide » pointant en dur vers
+`http://127.0.0.1:8000/docs/learner_guide.md` (mort en production : ouvre
+localhost sur la machine du visiteur). Aucune explication de ce que fait
+l'outil ni de sa valeur avant que l'utilisateur doive deviner en tapant
+« Hello! ».
+
+**Découverte utile.** `orchestrator.py::_help_text()` (commande `aide`) sert
+déjà un guide correct **en français**, indépendant du fichier
+`docs/learner_guide.md` (resté en anglais, jamais traduit, seulement utilisé
+par le bouton cassé). Le bouton cassé était donc à la fois inutile et
+redondant.
+
+**Correctifs (web/src/app).**
+- `layout.tsx` : `lang="fr"`, titre d'onglet et description en français.
+- `page.tsx` : suppression du bouton « Learner Guide » cassé ; libellés des
+  deux boutons restants traduits (Vue partagée/Plein écran, Mode clair/Mode
+  sombre).
+- `ChatKitComponent.tsx` : bandeau d'intro (titre, une phrase sur la valeur
+  de l'outil : QCM adaptatif, indices, reconnaissance de symboles par photo,
+  suivi de progression) avec bouton « Démarrer le diagnostic » qui appelle
+  `chatkit.sendUserMessage({text: "start diagnostic"})` (pas
+  `chatkit.control.sendUserMessage`, qui n'existe pas dans
+  `@openai/chatkit-react` 1.1.1 — piège tsc rencontré et corrigé). Bandeau
+  masqué automatiquement au premier message envoyé (`onResponseStart`).
+  Greeting et 3 suggestions de démarrage traduites et alignées sur les
+  commandes réelles du backend (`start diagnostic` / `radar` / `aide`,
+  icônes `star-filled` / `chart` / `book-open`). Placeholder du composer,
+  message d'erreur, bouton Réessayer, et libellés du volet latéral
+  (Fermer/Source PDF/Graphique/Carte) traduits.
+
+**Validation avant déploiement.** `npx tsc --noEmit` propre, `next build`
+propre, `next start` local sur le port 3900 + capture d'écran
+(`agent-browser`) : bandeau et suggestions conformes. Pas de test du clic
+réel « Démarrer le diagnostic » (aurait déclenché un vrai appel à l'API
+OpenAI facturé sur la clé de l'utilisateur, sans ajouter de certitude par
+rapport à la vérification de type + relecture de code).
+
+**Déploiement.** `web` -> `:v6` (mêmes `--build-arg` que `:v5`), push
+registre, update + redeploy, vérifié `ready` puis re-testé en navigateur
+réel sur `formation.gclab.fr` : rendu identique à l'aperçu local, aucune
+erreur console.
+
+**Git.** Commits `ce81d16` (accueil francisé), poussés sur `fork`.
+
+**Non fait à ce stade (pistes possibles, non demandées).** Traduction
+complète de `docs/learner_guide.md` (actuellement mort, sans conséquence
+puisque non lié depuis l'UI) ; persistance du bandeau masqué en
+`localStorage` (actuellement remis à zéro à chaque rechargement, volontaire
+: garder simple, un pompier revient rarement plusieurs fois par session) ;
+tour guidé pas à pas au-delà du bandeau statique.
