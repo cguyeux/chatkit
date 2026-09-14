@@ -176,5 +176,27 @@ du clic réel sur le CTA final (aurait déclenché un appel facturé à l'API
 OpenAI, backend non lancé en local de toute façon). Session `agent-browser`
 et serveur `next start` local fermés en fin de vérification.
 
-**Non fait.** Build/push/déploiement Scaleway (`:v7`) : en attente de
-décision de l'utilisateur, cf. proposition d'enchaînement.
+**Décision utilisateur (sondage).** Committer + pousser sur `fork` puis
+déployer immédiatement (option recommandée retenue, plutôt que commit seul
+ou ne rien faire).
+
+**Git.** Commit `5423e61` (« feat(ux): tour guidé pas à pas pour l'accueil
+pompiers »), poussé sur `fork` (`8f2fd30..5423e61`). `origin` non touché.
+
+**Déploiement.** Garde-fou ressources partagées déclenché au premier essai
+de build (22 sessions vivantes, plafond 12) ; mesure réelle faite
+(`agentctl status` : load1 ~1.8/16, RAM 24.8 Gio dispo, PSI io <1%) avant de
+forcer, session enregistrée au registre (`docs-38` / `agentctl register`),
+tâche déclarée `agentctl task start --force --why` (T02031, 2 Gio/2 cœurs,
+~1 min réelle, même profil que les forçages v5/v6). `web` -> `:v7` (mêmes
+`--build-arg` qu'en v5/v6, URL backend et domainKey inchangés), push
+registre, `scw container container update` + attente `ready` (~20s).
+
+**Vérification navigateur réel (agent-browser, site public
+`formation.gclab.fr`).** Tour guidé affiché dès le chargement, sans
+`IntegrationError` ni « chat n'a pas pu se charger » (backend réel
+joignable, contrairement au test local sans backend). Rendu identique à
+l'aperçu local. Session fermée après capture.
+
+**Dette documentaire corrigée.** `DEPLOY_SCALEWAY.md` : image `web`
+`:v6` -> `:v7`.
