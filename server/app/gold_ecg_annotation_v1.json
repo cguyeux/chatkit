@@ -57,8 +57,8 @@
     {"id":"g_m8","title":"VI - DONNÉES CONTEXTUELLES","kind":"MODULE","pages":[21]},
     {"id":"g_k30","title":"6.1 DONNÉES CONTEXTUELLES","kind":"KC","pages":[21]},
 
-    {"id":"g_k31","title":"CARTOGRAPHIE OPERATIONNELLE - exemple feu urbain","kind":"KC","pages":[22]},
-    {"id":"g_k32","title":"CARTOGRAPHIE OPERATIONNELLE - exemple feu de forêt","kind":"KC","pages":[23]}
+    {"id":"g_k31","title":"CARTOGRAPHIE OPÉRATIONNELLE - exemple feu urbain","kind":"KC","pages":[22]},
+    {"id":"g_k32","title":"CARTOGRAPHIE OPÉRATIONNELLE - exemple feu de forêt","kind":"KC","pages":[23]}
   ],
 
   "contains": [
@@ -208,8 +208,8 @@
     "g_m8":{"pages":[21],"heading_path":["VI - DONNÉES CONTEXTUELLES"]},
     "g_k30":{"pages":[21],"heading_path":["VI - DONNÉES CONTEXTUELLES","6.1 DONNÉES CONTEXTUELLES"]},
 
-    "g_k31":{"pages":[22],"heading_path":["CARTOGRAPHIE OPERATIONNELLE - exemple feu urbain"]},
-    "g_k32":{"pages":[23],"heading_path":["CARTOGRAPHIE OPERATIONNELLE - exemple feu de forêt"]}
+    "g_k31":{"pages":[22],"heading_path":["CARTOGRAPHIE OPÉRATIONNELLE - exemple feu urbain"]},
+    "g_k32":{"pages":[23],"heading_path":["CARTOGRAPHIE OPÉRATIONNELLE - exemple feu de forêt"]}
   },
 
   "annotation_decisions": [

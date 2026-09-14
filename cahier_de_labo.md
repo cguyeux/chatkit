@@ -220,3 +220,43 @@ l'époque).
 
 **Garde-fous respectés.** Rien poussé sur `origin` (helmi1105), uniquement
 sur `fork` (cguyeux). Aucune clé affichée ni commitée.
+
+---
+
+## 2026-09-14 17h30 — Site public inaccessible (chat vide) ; domainKey ChatKit renseignée ; round-trip revalidé en v5
+
+**Signalement.** L'utilisateur signale que `https://formation.gclab.fr/` « ne
+marche pas ». Diagnostic (`agent-browser`, console + réseau) : le serveur
+répond bien (HTTP 200, tous les chunks Next.js chargent), mais le widget
+ChatKit échoue avec `IntegrationError: Domain verification failed for
+https://formation.gclab.fr`, renvoyant vers
+`platform.openai.com/settings/organization/security/domain-allowlist`. Le
+panneau central restait vide (seuls les 3 boutons de contrôle s'affichaient).
+Cause confirmée dans le code : `web/src/app/ChatKitComponent.tsx` lit
+`NEXT_PUBLIC_CHATKIT_DOMAIN_KEY`, restée au placeholder documenté dans
+`DEPLOY_SCALEWAY.md` (`localhost`) malgré les builds `:v3`/`:v4` — le domaine
+`formation.gclab.fr` n'avait donc jamais été validé côté OpenAI.
+
+**Correctif.** L'utilisateur a ajouté `formation.gclab.fr` à l'allowlist de
+domaines de son organisation OpenAI et fourni la clé publique générée
+(`domain_pk_6aa8...4444`, valeur complète dans `DEPLOY_SCALEWAY.md`). Rebuild
+`web` -> `:v5` avec `--build-arg NEXT_PUBLIC_CHATKIT_DOMAIN_KEY=<cette clé>`
+(URL backend inchangée), push registre, `scw container container update` +
+attente `ready` (~30s).
+
+**Vérification navigateur réel (agent-browser, site public).** Plus
+d'`IntegrationError` en console ; écran d'accueil ChatKit affiché (« Hey,
+what can I do for you? », composer « Your Agent is ready! »).
+
+**Garde-fous respectés.** Machine chargée en nombre de sessions (22 vivantes,
+plafond 12) mais CPU/RAM réellement disponibles (load1 ~3/16, 25 Gio libres) :
+tâche déclarée via `agentctl task start --force --why` (T99441, 2 Gio/2
+cœurs, ~2 min réelles) plutôt que forcée en silence. Rien poussé sur `origin`
+(helmi1105), uniquement build/push registre Scaleway. Aucune clé secrète
+(OPENAI_API_KEY) touchée ; la clé de domaine, publique par nature (`domain_pk_`),
+est documentée en clair dans `DEPLOY_SCALEWAY.md` comme le reste de la
+configuration de déploiement.
+
+**Dette documentaire corrigée.** `DEPLOY_SCALEWAY.md` indiquait encore l'image
+`web:v1` et le placeholder `localhost` alors que le déploiement réel en était
+à `:v4` : mis à jour pour refléter `:v5` et la vraie clé.

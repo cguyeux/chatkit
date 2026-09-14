@@ -17,7 +17,7 @@ message (coût par requête). Endpoint public = dépense ouverte sur la clé uti
 | Container frontend | `web` (id `01416308-9185-4fa2-b1fd-cc432053d997`), port 8080 |
 | Backend URL | https://chatkitf92c84e6-api.functions.fnc.fr-par.scw.cloud |
 | Frontend URL (public) | https://chatkitf92c84e6-web.functions.fnc.fr-par.scw.cloud |
-| Images | `rg.fr-par.scw.cloud/chatkit/{api,web}:v1` |
+| Images | `rg.fr-par.scw.cloud/chatkit/api:v1`, `rg.fr-par.scw.cloud/chatkit/web:v5` (versions divergentes, la doc n'avait pas suivi les updates intermédiaires) |
 
 ## Configuration / variables
 
@@ -31,10 +31,12 @@ message (coût par requête). Endpoint public = dépense ouverte sur la clé uti
 - **Frontend** `web` (Next.js standalone, `NEXT_PUBLIC_*` bakés AU BUILD via
   `--build-arg`) :
   - `NEXT_PUBLIC_CHATKIT_API_URL` = URL publique du backend (baké à v1).
-  - `NEXT_PUBLIC_CHATKIT_DOMAIN_KEY` = `localhost` (placeholder). **À remplacer**
-    par la vraie clé de domaine une fois le domaine frontend enregistré dans
-    l'allowlist OpenAI (platform.openai.com → security → domain-allowlist), sinon
-    le widget ChatKit peut refuser de se charger en production (cf. README amont).
+  - `NEXT_PUBLIC_CHATKIT_DOMAIN_KEY` = `domain_pk_6aa810d2bd3c8195872895a04b628d3b076759a02a964444`
+    (clé réelle, domaine `formation.gclab.fr` enregistré dans l'allowlist OpenAI
+    depuis le 2026-09-14 ; bakée dans l'image `web:v5`). Si le domaine public change
+    ou que la clé est régénérée côté OpenAI, refaire le rebuild (§ ci-dessous) avec
+    la nouvelle valeur, sinon le widget ChatKit échoue avec
+    `IntegrationError: Domain verification failed`.
 
 ## Modifications de code (locales, non poussées)
 
