@@ -2,6 +2,7 @@
 
 import { useState, useCallback, useEffect } from "react"
 import { ChatKit, useChatKit, type ColorScheme } from "@openai/chatkit-react"
+import GuidedTour, { TOUR_STEPS } from "./GuidedTour"
 
 type ChatKitComponentProps = {
   userId: string
@@ -26,7 +27,8 @@ function ChatKitComponent({
   const [mapState, setMapState] = useState<MapState>(null)
   const [plotHtml, setPlotHtml] = useState<string | null>(null) // plot HTML
   const [pdfUrl, setPdfUrl] = useState<string | null>(null)
-  const [showIntro, setShowIntro] = useState(true)
+  const [showTour, setShowTour] = useState(true)
+  const [tourStep, setTourStep] = useState(0)
 
   // --- script availability effect (unchanged) ---
   useEffect(() => {
@@ -249,7 +251,7 @@ function ChatKitComponent({
     },
     onResponseStart: () => {
       setError(null)
-      setShowIntro(false)
+      setShowTour(false)
     },
     onThreadLoadStart: (event) => {
       console.log("Thread load started: ", event.threadId)
@@ -290,38 +292,29 @@ return (
       maximize ? "w-full" : "w-80 ml-auto"
     }`}
   >
-    {showIntro && (
-      <div className="shrink-0 m-3 mb-0 rounded-xl border border-slate-200 bg-slate-50 p-4 dark:border-slate-700 dark:bg-slate-800/60">
-        <div className="flex items-start justify-between gap-3">
-          <h1 className="text-sm font-semibold text-slate-900 dark:text-slate-100">
-            Formateur intelligent : cartographie opérationnelle
-          </h1>
-          <button
-            type="button"
-            aria-label="Masquer"
-            onClick={() => setShowIntro(false)}
-            className="shrink-0 rounded-full px-2 text-slate-400 hover:text-slate-700 dark:hover:text-slate-200"
-          >
-            ×
-          </button>
-        </div>
-        <p className="mt-1 text-xs leading-relaxed text-slate-600 dark:text-slate-300">
-          Cet assistant fait réviser le mémento officiel gestion opérationnelle et commandement
-          (formes, couleurs, symboles) avec des questions qui s&apos;adaptent à votre niveau, des
-          indices personnalisés en cas d&apos;erreur, la reconnaissance de symboles à partir
-          d&apos;une photo, et un suivi de votre progression module par module.
-        </p>
-        <button
-          type="button"
-          onClick={() => {
-            setShowIntro(false)
-            chatkit.sendUserMessage({ text: "start diagnostic" })
-          }}
-          className="mt-3 rounded-lg bg-slate-900 px-3 py-1.5 text-xs font-semibold text-white hover:bg-slate-800 dark:bg-slate-100 dark:text-slate-900 dark:hover:bg-slate-200"
-        >
-          Démarrer le diagnostic
-        </button>
-      </div>
+    {showTour && (
+      <GuidedTour
+        step={tourStep}
+        onPrev={() => setTourStep((s) => Math.max(0, s - 1))}
+        onNext={() => setTourStep((s) => Math.min(TOUR_STEPS.length - 1, s + 1))}
+        onSkip={() => setShowTour(false)}
+        onStart={() => {
+          setShowTour(false)
+          chatkit.sendUserMessage({ text: "start diagnostic" })
+        }}
+      />
+    )}
+    {!showTour && (
+      <button
+        type="button"
+        onClick={() => {
+          setTourStep(0)
+          setShowTour(true)
+        }}
+        className="absolute left-3 top-3 z-10 rounded-full bg-slate-900/90 px-3 py-1 text-[11px] font-medium text-slate-50 shadow-sm ring-1 ring-slate-700/70 hover:bg-slate-900 dark:bg-slate-800/90 dark:text-slate-100 dark:ring-slate-600/70"
+      >
+        🧭 Visite guidée
+      </button>
     )}
     <div className="flex flex-1 w-full min-h-0">
       <div className={showRightPane ? "w-1/2 border-r border-slate-200" : "w-full"}>
