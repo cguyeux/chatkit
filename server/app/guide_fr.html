@@ -3,181 +3,86 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>Guide d'utilisation — Formateur cartographie opérationnelle</title>
+<title>Guide d'utilisation : formateur cartographie opérationnelle</title>
 <style>
-  :root {
-    --bg: #f1f5f9;
-    --panel: #ffffff;
-    --text: #0f172a;
-    --muted: #475569;
-    --border: #e2e8f0;
-    --chip-bg: #0f172a;
-    --chip-text: #f8fafc;
-    --accent: #0f172a;
-  }
-  @media (prefers-color-scheme: dark) {
-    :root {
-      --bg: #020617;
-      --panel: #0f172a;
-      --text: #f1f5f9;
-      --muted: #94a3b8;
-      --border: #1e293b;
-      --chip-bg: #f1f5f9;
-      --chip-text: #0f172a;
-      --accent: #f1f5f9;
-    }
-  }
-  * { box-sizing: border-box; }
-  body {
-    margin: 0;
-    background: var(--bg);
-    color: var(--text);
-    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
-    line-height: 1.55;
-  }
-  .wrap {
-    max-width: 720px;
-    margin: 0 auto;
-    padding: 32px 20px 64px;
-  }
-  header {
-    margin-bottom: 28px;
-  }
-  h1 {
-    font-size: 1.5rem;
-    margin: 0 0 6px;
-  }
-  header p {
-    color: var(--muted);
-    margin: 0;
-    font-size: 0.95rem;
-  }
-  section {
-    background: var(--panel);
-    border: 1px solid var(--border);
-    border-radius: 14px;
-    padding: 18px 20px;
-    margin-bottom: 16px;
-  }
-  h2 {
-    font-size: 1.05rem;
-    margin: 0 0 10px;
-  }
-  ol, ul {
-    margin: 0;
-    padding-left: 1.2em;
-  }
-  li { margin-bottom: 6px; }
-  li:last-child { margin-bottom: 0; }
-  p { margin: 0 0 10px; }
-  p:last-child { margin-bottom: 0; }
-  code {
-    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-    background: var(--chip-bg);
-    color: var(--chip-text);
-    padding: 1px 7px;
-    border-radius: 999px;
-    font-size: 0.85em;
-    white-space: nowrap;
-  }
-  table {
-    width: 100%;
-    border-collapse: collapse;
-    font-size: 0.92rem;
-  }
-  td {
-    padding: 6px 0;
-    border-bottom: 1px solid var(--border);
-    vertical-align: top;
-  }
-  td:first-child { white-space: nowrap; padding-right: 14px; }
-  tr:last-child td { border-bottom: none; }
+  :root { --bg:#f1f5f9; --panel:#fff; --text:#0f172a; --muted:#475569; --border:#e2e8f0; --chip-bg:#0f172a; --chip-text:#f8fafc; }
+  @media (prefers-color-scheme: dark) { :root { --bg:#020617; --panel:#0f172a; --text:#f1f5f9; --muted:#94a3b8; --border:#1e293b; --chip-bg:#f1f5f9; --chip-text:#0f172a; } }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--text); font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif; line-height:1.55; }
+  .wrap { max-width:720px; margin:0 auto; padding:32px 20px 64px; }
+  header { margin-bottom:28px; }
+  h1 { font-size:1.5rem; margin:0 0 6px; }
+  header p { color:var(--muted); margin:0; font-size:.95rem; }
+  section { background:var(--panel); border:1px solid var(--border); border-radius:14px; padding:18px 20px; margin-bottom:16px; }
+  h2 { font-size:1.05rem; margin:0 0 10px; }
+  ul, ol { margin:0; padding-left:20px; }
+  li { margin:4px 0; }
+  code { background:var(--chip-bg); color:var(--chip-text); padding:1px 7px; border-radius:999px; font-size:.85em; }
+  p { margin:6px 0; }
+  .muted { color:var(--muted); font-size:.9rem; }
 </style>
 </head>
 <body>
 <div class="wrap">
   <header>
     <h1>Guide d'utilisation</h1>
-    <p>Formateur intelligent : cartographie opérationnelle — mémento officiel gestion opérationnelle et commandement.</p>
+    <p>Formateur intelligent : cartographie opérationnelle, mémento gestion opérationnelle et commandement (outils graphiques). Démonstrateur réservé aux formateurs.</p>
   </header>
 
   <section>
-    <h2>Ce que fait cet outil</h2>
+    <h2>Ce que fait l'outil</h2>
     <ul>
-      <li>estimer votre niveau avec un diagnostic à choix multiples ;</li>
-      <li>enseigner une notion à la fois, avec une mini-leçon ;</li>
-      <li>répondre à vos questions pendant la leçon ;</li>
-      <li>générer des quiz d'entraînement adaptés à votre niveau ;</li>
-      <li>expliquer vos erreurs et donner des indices progressifs ;</li>
-      <li>suivre votre progression, notion par notion ;</li>
-      <li>identifier un symbole à partir d'une photo.</li>
+      <li>situe votre niveau avec un diagnostic rapide sur tout le mémento ;</li>
+      <li>enseigne une notion à la fois, avec une leçon courte et la page du mémento ;</li>
+      <li>vous fait valider chaque notion par un quiz, puis chaque chapitre par un contrôle ;</li>
+      <li>corrige question par question, explique vos erreurs et donne des indices ;</li>
+      <li>répond à vos questions libres sur le mémento, à tout moment ;</li>
+      <li>identifie un symbole à partir d'une photo ;</li>
+      <li>garde votre progression d'une visite à l'autre sur le même navigateur.</li>
     </ul>
-  </section>
-
-  <section>
-    <h2>Comment démarrer</h2>
-    <p>Tapez <code>start diagnostic</code>, ou cliquez sur le bouton correspondant. Le diagnostic estime votre niveau sur plusieurs notions ; il ne valide rien en soi, la validation se fait ensuite par les quiz d'entraînement.</p>
   </section>
 
   <section>
     <h2>Déroulé conseillé</h2>
     <ol>
-      <li>Tapez <code>start diagnostic</code> pour démarrer l'estimation de niveau.</li>
-      <li>Répondez au QCM diagnostic (juste une estimation, pas une notation).</li>
-      <li>Lisez la mini-leçon proposée pour la notion la plus faible.</li>
-      <li>Posez une question si quelque chose n'est pas clair.</li>
-      <li>Tapez <code>practice</code> pour lancer un quiz adapté à cette notion.</li>
-      <li>En cas d'erreur, lisez le retour puis tapez <code>hint</code> pour un indice progressif.</li>
-      <li>Refaites <code>practice</code> jusqu'à validation.</li>
-      <li>Une fois la notion validée, tapez <code>next</code> pour passer à la suivante.</li>
-      <li>Tapez <code>radar</code> à tout moment pour voir votre progression.</li>
+      <li>Cliquez sur <code>Commencer le diagnostic</code> : une dizaine de questions, une par notion, réparties sur tous les chapitres. Ce n'est pas une note, c'est ce qui choisit par quoi commencer.</li>
+      <li>Lisez le corrigé, puis la leçon de la première notion à travailler. La page du mémento s'affiche à côté.</li>
+      <li>Cliquez sur <code>Lancer le quiz</code>. À 70 % de bonnes réponses, la notion est validée.</li>
+      <li>En cas d'échec : corrigé détaillé, <code>Un indice</code> (trois indices progressifs), <code>Revoir la leçon</code>, puis <code>Refaire le quiz</code>.</li>
+      <li>Une fois la notion validée, <code>Notion suivante</code>. À la fin d'un chapitre, un contrôle regroupe ses notions.</li>
+      <li><code>Ma progression</code> montre les notions validées par chapitre et un radar.</li>
     </ol>
+    <p class="muted">Les boutons sous chaque message proposent toujours la suite. Vous pouvez aussi taper : quiz, indice, notion suivante, ma progression, aide, revoir la leçon, recommencer à zéro.</p>
   </section>
 
   <section>
-    <h2>Commandes</h2>
-    <table>
-      <tr><td><code>start diagnostic</code></td><td>démarrer le diagnostic global.</td></tr>
-      <tr><td><code>practice</code></td><td>générer un quiz adapté à la notion en cours.</td></tr>
-      <tr><td><code>hint</code></td><td>obtenir l'indice suivant après une erreur.</td></tr>
-      <tr><td><code>next</code></td><td>passer à la notion suivante après validation.</td></tr>
-      <tr><td><code>radar</code></td><td>afficher la progression par notion et par module.</td></tr>
-      <tr><td><code>aide</code></td><td>réafficher ce guide directement dans le chat.</td></tr>
-      <tr><td><code>clear image</code></td><td>oublier la photo de symbole active.</td></tr>
-    </table>
+    <h2>Répondre à un quiz</h2>
+    <p>Cochez une proposition par question puis <code>Valider mes réponses</code>. Vous pouvez aussi taper vos réponses dans le chat, par exemple <code>1A 2C 3B 4D</code>.</p>
+    <p>Chaque question du corrigé porte un bouton <code>Signaler cette question</code> : utilisez-le si une question est ambiguë ou fausse, le signalement est transmis aux formateurs.</p>
   </section>
 
   <section>
-    <h2>Répondre à un QCM</h2>
-    <p>Répondez directement dans le quiz affiché, ou tapez vos réponses dans le chat, par exemple :</p>
-    <p><code>1A 2C 3B 4D</code></p>
+    <h2>Poser une question</h2>
+    <p>Tapez votre question dans le champ de message, même pendant un quiz. La réponse s'appuie uniquement sur le mémento et cite les pages. Si le point relève d'une notion vue plus tard dans le parcours, l'outil le signale.</p>
   </section>
 
   <section>
-    <h2>Poser une question pendant la leçon</h2>
-    <p>Pendant une mini-leçon, vous pouvez poser des questions de clarification, par exemple « pourquoi le bleu est-il lié à l'eau ? ». Les réponses restent centrées sur la notion en cours et les précédentes, pour garder un parcours cohérent.</p>
+    <h2>Envoyer la photo d'un symbole</h2>
+    <p>Joignez une photo et demandez ce qu'elle signifie. L'assistant décrit la forme, la couleur, le contour et le texte, puis relie chaque élément à sa signification dans le mémento. Les questions suivantes réutilisent la même photo ; <code>Oublier la photo</code> repart d'une image neuve.</p>
   </section>
 
   <section>
-    <h2>Envoyer une photo de symbole</h2>
-    <p>Joignez une photo d'un symbole et demandez ce qu'il signifie. L'assistant analyse la forme, la couleur, le contour, le texte et le pictogramme visibles, à partir du mémento officiel.</p>
-    <p>Vous pouvez ensuite poser des questions de suivi sur la même image (« et la couleur ? », « pourquoi orange ? ») sans la renvoyer. Pour repartir d'une image neuve, tapez <code>clear image</code>.</p>
-  </section>
-
-  <section>
-    <h2>Suivi de progression</h2>
-    <p>Tapez <code>radar</code> pour un graphique de votre progression par notion et par module, construit à partir de vos quiz d'entraînement, pas seulement du diagnostic initial.</p>
+    <h2>Réglages</h2>
+    <p>L'icône engrenage permet de choisir le modèle (Mistral par défaut, OpenAI en second choix), de coller sa propre clé API si le quota partagé est épuisé, et de tout remettre à zéro.</p>
   </section>
 
   <section>
     <h2>Points importants</h2>
     <ul>
-      <li>Le diagnostic est seulement une estimation de niveau.</li>
-      <li>Les quiz d'entraînement valident la maîtrise d'une notion.</li>
-      <li>Il faut valider la notion en cours avant de passer à la suivante.</li>
-      <li>Un contrôle de module peut apparaître avant de continuer.</li>
-      <li>Une question hors du champ du cours peut être refusée ou réorientée.</li>
-      <li>Si une photo n'est pas assez nette, une photo plus claire peut être demandée.</li>
+      <li>Le diagnostic est une estimation, pas une validation ; seuls les quiz valident.</li>
+      <li>Il faut valider la notion en cours avant de passer à la suivante, et réussir le contrôle de chapitre avant le chapitre suivant.</li>
+      <li>Les questions sont générées à partir du mémento ; si l'une vous semble fausse, signalez-la.</li>
+      <li>Une photo floue peut donner une réponse prudente : envoyez une photo plus nette.</li>
     </ul>
   </section>
 </div>
