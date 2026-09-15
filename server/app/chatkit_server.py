@@ -31,6 +31,7 @@ from chatkit.store import Store, AttachmentStore
 from chatkit.types import UserMessageItem as CKUserMessageItem, AssistantMessageItem as CKAssistantMessageItem
 # 🔹 Import your multi-agent orchestrator
 from app.orchestrator import Orchestrator, extract_latest_user_text
+from app.providers import friendly_llm_error
 from app.widgets.qcmwidget import build_qcm_widget_from_data
 from app.widgets.studywidget import build_study_widget_from_data
 from app.widgets.mapwidget import build_map_widget_from_data   
@@ -137,7 +138,7 @@ class MyChatKitServer(ChatKitServer[dict[str, Any]]):
         try:
             result_text = await self.orch.handle(user_input=input_items, ctx=agent_context)
         except Exception as e:
-            result_text = f"⚠️ Internal error: {e}"
+            result_text = friendly_llm_error(e)
       
 
         if isinstance(result_text, dict):
@@ -290,7 +291,17 @@ class MyChatKitServer(ChatKitServer[dict[str, Any]]):
                 return
 
             # ✅ run the workflow step
-            result = await self.orch.handle_qcm_submit(submitted_answers, agent_context)
+            try:
+                result = await self.orch.handle_qcm_submit(submitted_answers, agent_context)
+            except Exception as e:
+                message_item = AssistantMessageItem(
+                    thread_id=_thread.id,
+                    id=self.store.generate_item_id("message", _thread, _context),
+                    created_at=datetime.now(),
+                    content=[AssistantMessageContent(text=friendly_llm_error(e))],
+                )
+                yield ThreadItemDoneEvent(item=message_item)
+                return
 
             # render like respond()
             if isinstance(result, dict):

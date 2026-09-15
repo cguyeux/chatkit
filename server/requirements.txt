@@ -1,4 +1,8 @@
 openai-chatkit
 fastapi
-openai-agents
+openai-agents[litellm]
 uvicorn
+pymupdf
+pytesseract
+pillow
+rank-bm25

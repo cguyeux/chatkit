@@ -100,8 +100,17 @@ async def chatkit_endpoint(request: Request) -> Response:
             }
         )
 
+    # Model-provider choice travels per-request, set by the frontend's
+    # settings panel (sessionStorage + custom fetch headers) -- no server-side
+    # session state for it. Validated/defaulted in orchestrator.py, not here.
+    provider = request.headers.get("X-Provider")
+    api_key = request.headers.get("X-Provider-Api-Key")
+
     payload = await request.body()
-    result = await server.process(payload, context={USER_ID_KEY: userId})
+    result = await server.process(
+        payload,
+        context={USER_ID_KEY: userId, "provider": provider, "api_key": api_key},
+    )
 
     if isinstance(result, StreamingResult):
         return StreamingResponse(result, media_type="text/event-stream")

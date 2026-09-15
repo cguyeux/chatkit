@@ -9,14 +9,23 @@ from urllib.parse import quote
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
-from agents import Agent, Runner, FileSearchTool, ModelSettings
+from agents import Agent, Runner
 from chatkit.agents import AgentContext
 from app.viz.radar_html import build_radar_dashboard_html
+from app.providers import (
+    DEFAULT_PROVIDER,
+    KNOWN_PROVIDERS,
+    ProviderChoice,
+    build_model,
+    build_model_settings,
+    build_tools,
+    current_provider,
+    run_agent_text,
+)
 
 # =====================================================
 # CONFIG
-# ===================================================== VECTOR_STORE_ID vs_6a1d49343a688191a1a714ca3dafc3d8  personal vectore  store
-VECTOR_STORE_ID = os.getenv("VECTOR_STORE_ID", "vs_6a116b3869e08191aa26f247b322a8c1")  # api  key labo
+# ===================================================== VECTOR_STORE_ID moved to app/providers.py
 # Public base URL of THIS backend (used to build absolute links to /static PDFs).
 # Overridden at deploy time with the container's public endpoint.
 PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "http://127.0.0.1:8000").rstrip("/")
@@ -840,27 +849,29 @@ class TutorDecisionPolicy:
 class DiagnosticQcmAgent:
     """Global Diagnostic QCM (across several KCs)."""
 
-    def __init__(self) -> None:
-        self.tool = FileSearchTool(max_num_results=6, vector_store_ids=[VECTOR_STORE_ID])
-        self.agent: Agent[AgentContext] = Agent[AgentContext](
+    INSTRUCTIONS = (
+        "You create a GLOBAL diagnostic multiple-choice quiz.\n"
+        "Use ONLY doctrine content from file_search.\n"
+        "Return ONLY valid JSON.\n"
+        "Each question MUST include:\n"
+        "- number (int)\n"
+        "- text (string)\n"
+        "- choices (array of 4 strings)\n"
+        "- question text under 240 characters\n"
+        "- each choice under 90 characters\n"
+        "- answer (A/B/C/D)\n"
+        "- kc_id (string)\n"
+        "Questions must be mapped to the provided kc list."
+    )
+
+    def _build_agent(self) -> Agent[AgentContext]:
+        choice = current_provider.get()
+        return Agent[AgentContext](
             name="Diagnostic-QCM_Agent",
-            model="gpt-4.1",
-            tools=[self.tool],
-            instructions=(
-                "You create a GLOBAL diagnostic multiple-choice quiz.\n"
-                "Use ONLY doctrine content from file_search.\n"
-                "Return ONLY valid JSON.\n"
-                "Each question MUST include:\n"
-                "- number (int)\n"
-                "- text (string)\n"
-                "- choices (array of 4 strings)\n"
-                "- question text under 240 characters\n"
-                "- each choice under 90 characters\n"
-                "- answer (A/B/C/D)\n"
-                "- kc_id (string)\n"
-                "Questions must be mapped to the provided kc list."
-            ),
-            model_settings=ModelSettings(store=True),
+            model=build_model(choice, openai_model="gpt-4.1"),
+            tools=build_tools(choice, max_results=6),
+            instructions=self.INSTRUCTIONS,
+            model_settings=build_model_settings(choice),
         )
 
     async def generate(self, kc_list: List[KCNode], n_questions: int, ctx: AgentContext) -> List[dict]:
@@ -888,28 +899,29 @@ Return ONLY JSON list:
   ...
 ]
 """
-        res = await Runner.run(self.agent, prompt, context=ctx)
-        raw = (res.final_output or "").strip()
+        raw = await run_agent_text(self._build_agent(), prompt, ctx)
         return normalize_qcm_answers(json.loads(raw), "Diagnostic-QCM")
 
 
 class KcEssentialTargetAgent:
     """Extracts essential assessable targets for a KC from the PDF."""
 
-    def __init__(self) -> None:
-        self.tool = FileSearchTool(max_num_results=8, vector_store_ids=[VECTOR_STORE_ID])
-        self.agent: Agent[AgentContext] = Agent[AgentContext](
+    INSTRUCTIONS = (
+        "You extract essential assessable learning targets for one KC.\n"
+        "Use only PDF/course doctrine from file_search.\n"
+        "Return only valid JSON.\n"
+        "Targets must be specific enough to generate QCM questions.\n"
+        "Do not include broad labels like 'understand the lesson'."
+    )
+
+    def _build_agent(self) -> Agent[AgentContext]:
+        choice = current_provider.get()
+        return Agent[AgentContext](
             name="KC-essential-target_Agent",
-            model="gpt-4.1",
-            tools=[self.tool],
-            instructions=(
-                "You extract essential assessable learning targets for one KC.\n"
-                "Use only PDF/course doctrine from file_search.\n"
-                "Return only valid JSON.\n"
-                "Targets must be specific enough to generate QCM questions.\n"
-                "Do not include broad labels like 'understand the lesson'."
-            ),
-            model_settings=ModelSettings(store=True),
+            model=build_model(choice, openai_model="gpt-4.1"),
+            tools=build_tools(choice, max_results=8),
+            instructions=self.INSTRUCTIONS,
+            model_settings=build_model_settings(choice),
         )
 
     async def extract(self, kc: KCNode, micro_lesson_text: str, ctx: AgentContext) -> List[str]:
@@ -935,8 +947,7 @@ Return ONLY JSON:
 {{"essential_targets":["...", "..."]}}
 """
         try:
-            res = await Runner.run(self.agent, prompt, context=ctx)
-            raw = (res.final_output or "").strip()
+            raw = await run_agent_text(self._build_agent(), prompt, ctx)
             data = json.loads(raw)
         except Exception:
             return []
@@ -953,38 +964,40 @@ Return ONLY JSON:
 class PracticeQcmAgent:
     """Adaptive practice QCM for one KC (LLM chooses number of questions)."""
 
-    def __init__(self) -> None:
-        self.tool = FileSearchTool(max_num_results=8, vector_store_ids=[VECTOR_STORE_ID])
-        self.agent: Agent[AgentContext] = Agent[AgentContext](
+    INSTRUCTIONS = (
+        "You create an ADAPTIVE practice quiz for ONE KC.\n"
+        "You MUST use doctrine content grounded in file_search.\n"
+        "\n"
+        "Return ONLY valid JSON with EXACTLY this shape:\n"
+        "{\n"
+        '  "n_questions": 6,\n'
+        '  "coverage_plan": [{"target_id":"E1","target":"...","question_numbers":[1]}],\n'
+        '  "questions": [\n'
+        '    {"number":1,"text":"...","choices":["..","..","..",".."],"answer":"A","target_id":"E1","target":"...","integrates_kc_ids":[]},\n'
+        "    ...\n"
+        "  ]\n"
+        "}\n"
+        "\n"
+        "Rules:\n"
+        "- n_questions must follow the provided adaptive range.\n"
+        "- Choose n_questions from lesson coverage, previous-KC integration, difficulty, attempts, and mistakes.\n"
+        "- Do not default to a small fixed quiz.\n"
+        "- questions length MUST equal n_questions.\n"
+        "- choices are 4 short options.\n"
+        "- Keep question text under 240 characters for widget readability.\n"
+        "- Keep each choice under 90 characters; put context in the question, not in the choices.\n"
+        "- answer is one of A/B/C/D.\n"
+        "- Focus on weak sub-points revealed by mistakes.\n"
+    )
+
+    def _build_agent(self) -> Agent[AgentContext]:
+        choice = current_provider.get()
+        return Agent[AgentContext](
             name="Practice-QCM_Agent",
-            model="gpt-4.1",
-            tools=[self.tool],
-            instructions=(
-                "You create an ADAPTIVE practice quiz for ONE KC.\n"
-                "You MUST use doctrine content grounded in file_search.\n"
-                "\n"
-                "Return ONLY valid JSON with EXACTLY this shape:\n"
-                "{\n"
-                '  "n_questions": 6,\n'
-                '  "coverage_plan": [{"target_id":"E1","target":"...","question_numbers":[1]}],\n'
-                '  "questions": [\n'
-                '    {"number":1,"text":"...","choices":["..","..","..",".."],"answer":"A","target_id":"E1","target":"...","integrates_kc_ids":[]},\n'
-                "    ...\n"
-                "  ]\n"
-                "}\n"
-                "\n"
-                "Rules:\n"
-                "- n_questions must follow the provided adaptive range.\n"
-                "- Choose n_questions from lesson coverage, previous-KC integration, difficulty, attempts, and mistakes.\n"
-                "- Do not default to a small fixed quiz.\n"
-                "- questions length MUST equal n_questions.\n"
-                "- choices are 4 short options.\n"
-                "- Keep question text under 240 characters for widget readability.\n"
-                "- Keep each choice under 90 characters; put context in the question, not in the choices.\n"
-                "- answer is one of A/B/C/D.\n"
-                "- Focus on weak sub-points revealed by mistakes.\n"
-            ),
-            model_settings=ModelSettings(store=True),
+            model=build_model(choice, openai_model="gpt-4.1"),
+            tools=build_tools(choice, max_results=8),
+            instructions=self.INSTRUCTIONS,
+            model_settings=build_model_settings(choice),
         )
 
     async def generate_adaptive(
@@ -1065,8 +1078,7 @@ Return ONLY JSON:
   ]
 }}
 """
-        res = await Runner.run(self.agent, prompt, context=ctx)
-        raw = (res.final_output or "").strip()
+        raw = await run_agent_text(self._build_agent(), prompt, ctx)
         parsed = json.loads(raw)
         normalize_qcm_answers(parsed.get("questions", []), "Practice-QCM")
         return parsed
@@ -1127,8 +1139,7 @@ Return ONLY JSON with the same shape:
   ]
 }}
 """
-        res = await Runner.run(self.agent, prompt, context=ctx)
-        raw = (res.final_output or "").strip()
+        raw = await run_agent_text(self._build_agent(), prompt, ctx)
         parsed = json.loads(raw)
         normalize_qcm_answers(parsed.get("questions", []), "Practice-QCM-repair")
         return parsed
@@ -1137,27 +1148,29 @@ Return ONLY JSON with the same shape:
 class ModuleQcmAgent:
     """Global module checkpoint quiz (covers all KCs in one module)."""
 
-    def __init__(self) -> None:
-        self.tool = FileSearchTool(max_num_results=8, vector_store_ids=[VECTOR_STORE_ID])
-        self.agent: Agent[AgentContext] = Agent[AgentContext](
+    INSTRUCTIONS = (
+        "You create a MODULE checkpoint multiple-choice quiz.\n"
+        "Use ONLY doctrine content from file_search.\n"
+        "Return ONLY valid JSON.\n"
+        "Each question MUST include:\n"
+        "- number (int)\n"
+        "- text (string)\n"
+        "- choices (array of 4 strings)\n"
+        "- question text under 240 characters\n"
+        "- each choice under 90 characters\n"
+        "- answer (A/B/C/D)\n"
+        "- kc_id (string)\n"
+        "Questions must be mapped to the provided kc list."
+    )
+
+    def _build_agent(self) -> Agent[AgentContext]:
+        choice = current_provider.get()
+        return Agent[AgentContext](
             name="Module-QCM_Agent",
-            model="gpt-5.1",
-            tools=[self.tool],
-            instructions=(
-                "You create a MODULE checkpoint multiple-choice quiz.\n"
-                "Use ONLY doctrine content from file_search.\n"
-                "Return ONLY valid JSON.\n"
-                "Each question MUST include:\n"
-                "- number (int)\n"
-                "- text (string)\n"
-                "- choices (array of 4 strings)\n"
-                "- question text under 240 characters\n"
-                "- each choice under 90 characters\n"
-                "- answer (A/B/C/D)\n"
-                "- kc_id (string)\n"
-                "Questions must be mapped to the provided kc list."
-            ),
-            model_settings=ModelSettings(store=True),
+            model=build_model(choice, openai_model="gpt-5.1"),
+            tools=build_tools(choice, max_results=8),
+            instructions=self.INSTRUCTIONS,
+            model_settings=build_model_settings(choice),
         )
 
     async def generate(self, module_title: str, kc_list: List[KCNode], n_questions: int, ctx: AgentContext) -> List[dict]:
@@ -1182,8 +1195,7 @@ Return ONLY JSON list:
   ...
 ]
 """
-        res = await Runner.run(self.agent, prompt, context=ctx)
-        raw = (res.final_output or "").strip()
+        raw = await run_agent_text(self._build_agent(), prompt, ctx)
         return normalize_qcm_answers(json.loads(raw), "Module-QCM")
 
 
@@ -1191,49 +1203,51 @@ Return ONLY JSON list:
 class MicroLessonAgent:
     """Adaptive KC micro-lesson rendered from a required lesson form."""
 
-    def __init__(self) -> None:
-        self.tool = FileSearchTool(max_num_results=8, vector_store_ids=[VECTOR_STORE_ID])
-        self.agent: Agent[AgentContext] = Agent[AgentContext](
+    INSTRUCTIONS = (
+        "You create an adaptive micro-lesson ONLY about the provided KC.\n"
+        "Ground every field in doctrine using file_search.\n"
+        "Return ONLY valid JSON, no markdown code fences.\n"
+        "The lesson must be short but must not omit essential doctrine for the KC.\n"
+        "Return this exact shape:\n"
+        "{\n"
+        '  "lesson_plan": {\n'
+        '    "lesson_complexity": "simple|medium|complex",\n'
+        '    "lesson_mode": "first_exposure|remediation|focused_review|brief_validation",\n'
+        '    "max_words": 240,\n'
+        '    "essential_information_count": 4,\n'
+        '    "reason": "..."\n'
+        "  },\n"
+        '  "lesson": {\n'
+        '    "title": "...",\n'
+        '    "source_basis": ["short copied or tightly paraphrased doctrine point from the PDF", "..."],\n'
+        '    "learning_objective": "...",\n'
+        '    "essential_information": ["...", "..."],\n'
+        '    "rule_to_remember": "...",\n'
+        '    "operational_example": "...",\n'
+        '    "common_mistake": "...",\n'
+        '    "targeted_remediation": "...",\n'
+        '    "self_check": "..."\n'
+        "  }\n"
+        "}\n"
+        "Rules:\n"
+        "- First retrieve the PDF content for the KC with file_search.\n"
+        "- lesson_plan must choose a budget from the KC complexity and learner state.\n"
+        "- max_words must be as short as possible but complete enough for the KC.\n"
+        "- source_basis must contain the key PDF facts/terms used to build the lesson.\n"
+        "- Preserve official doctrine terms, labels, colors, symbols, and operational names exactly when they appear in the PDF.\n"
+        "- Reformulate only explanations, not official terms.\n"
+        "- Do not add external knowledge or invented rules.\n"
+        "- If the PDF evidence is insufficient, say that in source_basis and keep the lesson conservative.\n"
+    )
+
+    def _build_agent(self) -> Agent[AgentContext]:
+        choice = current_provider.get()
+        return Agent[AgentContext](
             name="Micro-lesson_Agent",
-            model="gpt-4.1",
-            tools=[self.tool],
-            instructions=(
-                "You create an adaptive micro-lesson ONLY about the provided KC.\n"
-                "Ground every field in doctrine using file_search.\n"
-                "Return ONLY valid JSON, no markdown code fences.\n"
-                "The lesson must be short but must not omit essential doctrine for the KC.\n"
-                "Return this exact shape:\n"
-                "{\n"
-                '  "lesson_plan": {\n'
-                '    "lesson_complexity": "simple|medium|complex",\n'
-                '    "lesson_mode": "first_exposure|remediation|focused_review|brief_validation",\n'
-                '    "max_words": 240,\n'
-                '    "essential_information_count": 4,\n'
-                '    "reason": "..."\n'
-                "  },\n"
-                '  "lesson": {\n'
-                '    "title": "...",\n'
-                '    "source_basis": ["short copied or tightly paraphrased doctrine point from the PDF", "..."],\n'
-                '    "learning_objective": "...",\n'
-                '    "essential_information": ["...", "..."],\n'
-                '    "rule_to_remember": "...",\n'
-                '    "operational_example": "...",\n'
-                '    "common_mistake": "...",\n'
-                '    "targeted_remediation": "...",\n'
-                '    "self_check": "..."\n'
-                "  }\n"
-                "}\n"
-                "Rules:\n"
-                "- First retrieve the PDF content for the KC with file_search.\n"
-                "- lesson_plan must choose a budget from the KC complexity and learner state.\n"
-                "- max_words must be as short as possible but complete enough for the KC.\n"
-                "- source_basis must contain the key PDF facts/terms used to build the lesson.\n"
-                "- Preserve official doctrine terms, labels, colors, symbols, and operational names exactly when they appear in the PDF.\n"
-                "- Reformulate only explanations, not official terms.\n"
-                "- Do not add external knowledge or invented rules.\n"
-                "- If the PDF evidence is insufficient, say that in source_basis and keep the lesson conservative.\n"
-            ),
-            model_settings=ModelSettings(store=True),
+            model=build_model(choice, openai_model="gpt-4.1"),
+            tools=build_tools(choice, max_results=8),
+            instructions=self.INSTRUCTIONS,
+            model_settings=build_model_settings(choice),
         )
 
     def _validate_lesson_plan(
@@ -1385,8 +1399,7 @@ Constraints:
 - Use file_search to ground definitions/rules.
 - Return ONLY valid JSON with the required schema.
 """
-        res = await Runner.run(self.agent, prompt, context=ctx)
-        raw = (res.final_output or "").strip()
+        raw = await run_agent_text(self._build_agent(), prompt, ctx)
         try:
             data = json.loads(raw)
         except json.JSONDecodeError:
@@ -1421,22 +1434,24 @@ Constraints:
 class ExplainMistakeAgent:
     """Explain mistakes when score below threshold."""
 
-    def __init__(self) -> None:
-        self.tool = FileSearchTool(max_num_results=8, vector_store_ids=[VECTOR_STORE_ID])
-        self.agent: Agent[AgentContext] = Agent[AgentContext](
+    INSTRUCTIONS = (
+        "Tu expliques les erreurs de l'apprenant brievement et clairement.\n"
+        "Reponds toujours en francais.\n"
+        "Use doctrine from file_search.\n"
+        "Output plain text (no JSON).\n"
+        "Do not expose internal misconception labels.\n"
+        "Do not list every error if there are many; group similar errors.\n"
+        "Include: score interpretation, 2-4 key corrections, one mini-remediation, and next action."
+    )
+
+    def _build_agent(self) -> Agent[AgentContext]:
+        choice = current_provider.get()
+        return Agent[AgentContext](
             name="Explain-mistake_Agent",
-            model="gpt-4.1",
-            tools=[self.tool],
-            instructions=(
-                "Tu expliques les erreurs de l'apprenant brievement et clairement.\n"
-                "Reponds toujours en francais.\n"
-                "Use doctrine from file_search.\n"
-                "Output plain text (no JSON).\n"
-                "Do not expose internal misconception labels.\n"
-                "Do not list every error if there are many; group similar errors.\n"
-                "Include: score interpretation, 2-4 key corrections, one mini-remediation, and next action."
-            ),
-            model_settings=ModelSettings(store=True),
+            model=build_model(choice, openai_model="gpt-4.1"),
+            tools=build_tools(choice, max_results=8),
+            instructions=self.INSTRUCTIONS,
+            model_settings=build_model_settings(choice),
         )
 
     async def explain(self, kc: KCNode, wrong_items: List[dict], ctx: AgentContext) -> str:
@@ -1456,29 +1471,31 @@ Contraintes:
 - Donne une mini-remediation concrete.
 - Termine par: Tape "hint" pour un indice ou "practice" pour refaire un QCM cible.
 """
-        res = await Runner.run(self.agent, prompt, context=ctx)
+        res = await Runner.run(self._build_agent(), prompt, context=ctx)
         return (res.final_output or "").strip()
 
 
 class LearnerQuestionAgent:
     """Answers learner questions only inside the current learning frontier."""
 
-    def __init__(self) -> None:
-        self.tool = FileSearchTool(max_num_results=8, vector_store_ids=[VECTOR_STORE_ID])
-        self.agent: Agent[AgentContext] = Agent[AgentContext](
+    INSTRUCTIONS = (
+        "You answer learner clarification questions during a micro-lesson.\n"
+        "Use file_search for PDF grounding.\n"
+        "You may answer ONLY if the question concerns the current KC or previous KCs provided by the orchestrator.\n"
+        "If the learner asks about a future KC, do not teach it. Say it will be covered later and redirect to the current KC.\n"
+        "If the question is outside the course/PDF, say it is outside the current lesson scope.\n"
+        "Keep answers concise, pedagogical, and grounded in the provided allowed KC list.\n"
+        "Return plain text only."
+    )
+
+    def _build_agent(self) -> Agent[AgentContext]:
+        choice = current_provider.get()
+        return Agent[AgentContext](
             name="Learner-question_Agent",
-            model="gpt-4.1",
-            tools=[self.tool],
-            instructions=(
-                "You answer learner clarification questions during a micro-lesson.\n"
-                "Use file_search for PDF grounding.\n"
-                "You may answer ONLY if the question concerns the current KC or previous KCs provided by the orchestrator.\n"
-                "If the learner asks about a future KC, do not teach it. Say it will be covered later and redirect to the current KC.\n"
-                "If the question is outside the course/PDF, say it is outside the current lesson scope.\n"
-                "Keep answers concise, pedagogical, and grounded in the provided allowed KC list.\n"
-                "Return plain text only."
-            ),
-            model_settings=ModelSettings(store=True),
+            model=build_model(choice, openai_model="gpt-4.1"),
+            tools=build_tools(choice, max_results=8),
+            instructions=self.INSTRUCTIONS,
+            model_settings=build_model_settings(choice),
         )
 
     async def answer(
@@ -1521,25 +1538,27 @@ Decision rules:
 - Do not reveal full future-KC content, definitions, examples, or rules.
 - Mention source pages when available.
 """
-        res = await Runner.run(self.agent, prompt, context=ctx)
+        res = await Runner.run(self._build_agent(), prompt, context=ctx)
         return (res.final_output or "").strip()
 
 
 class VisualQuestionAgent:
     """Answers learner questions about uploaded symbol images using the whole PDF course."""
 
-    def __init__(self) -> None:
-        self.tool = FileSearchTool(max_num_results=8, vector_store_ids=[VECTOR_STORE_ID])
-        self.agent: Agent[AgentContext] = Agent[AgentContext](
+    INSTRUCTIONS = (
+        "Tu es un tuteur visuel pour les symboles cartographiques.\n"
+        "Reponds toujours en francais, sauf si l'apprenant demande une autre langue.\n"
+        "Analyse tous les elements visibles de l'image en details "
+    )
+
+    def _build_agent(self) -> Agent[AgentContext]:
+        choice = current_provider.get()
+        return Agent[AgentContext](
             name="Visual-symbol-question_Agent",
-            model="gpt-5.5",
-            tools=[self.tool],
-            instructions=(
-                "Tu es un tuteur visuel pour les symboles cartographiques.\n"
-                "Reponds toujours en francais, sauf si l'apprenant demande une autre langue.\n"
-                "Analyse tous les elements visibles de l'image en details "
-            ),
-            model_settings=ModelSettings(store=True),
+            model=build_model(choice, openai_model="gpt-5.5", vision=True),
+            tools=build_tools(choice, max_results=8),
+            instructions=self.INSTRUCTIONS,
+            model_settings=build_model_settings(choice),
         )
 
     async def answer(
@@ -1596,7 +1615,7 @@ Format de reponse :
         for image_url in image_urls:
             content.append({"type": "input_image", "image_url": image_url, "detail": "auto"})
         res = await Runner.run(
-            self.agent,
+            self._build_agent(),
             [{"role": "user", "content": content}],
             context=ctx,
         )
@@ -2189,6 +2208,12 @@ Details:
         low = text.lower()
 
         sess = self._get_sess(ctx)
+        request_context = getattr(ctx, "request_context", None) or {}
+        provider = request_context.get("provider")
+        current_provider.set(ProviderChoice(
+            provider=provider if provider in KNOWN_PROVIDERS else DEFAULT_PROVIDER,
+            api_key=request_context.get("api_key") or None,
+        ))
 
         if image_urls:
             return await self._answer_visual_question(sess, text, image_urls, ctx)
@@ -2948,4 +2973,10 @@ Details:
     # =====================================================
     async def handle_qcm_submit(self, submitted_answers: Dict[int, str], ctx: AgentContext) -> Any:
         sess = self._get_sess(ctx)
+        request_context = getattr(ctx, "request_context", None) or {}
+        provider = request_context.get("provider")
+        current_provider.set(ProviderChoice(
+            provider=provider if provider in KNOWN_PROVIDERS else DEFAULT_PROVIDER,
+            api_key=request_context.get("api_key") or None,
+        ))
         return await self._process_answers(sess, submitted_answers, ctx)

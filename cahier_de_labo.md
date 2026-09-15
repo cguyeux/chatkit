@@ -462,3 +462,137 @@ résultat avec `./` à la place de `.`. Contournement : remplacer le `.`
 de contexte par `$PWD` (équivalent fonctionnel, insensible à la
 réécriture), détecté en relisant le `body` renvoyé par le serveur
 avant `send_draft`, pas celui envoyé.
+
+---
+
+## 2026-09-15 14h45 — Sélecteur de modèle (Mistral par défaut, GPT-4.1 en second choix, clé API personnelle)
+
+**Contexte.** L'utilisateur a reformulé le périmètre : ce déploiement est un
+démonstrateur **local, réservé aux formateurs qui testent**, pas un service
+public à grande échelle. Ça change le calcul de risque sur le palier gratuit
+Mistral (coût nul, entraînement par défaut sur les données — acceptable ici,
+inacceptable pour de vrais stagiaires pompiers) et sur la clé personnelle
+(les formateurs, contrairement à des stagiaires grand public, peuvent
+raisonnablement en avoir une).
+
+**Demande.** Un menu déroulant dans l'interface, Mistral par défaut, GPT-4.1
+en second choix, et la possibilité de coller sa propre clé API si le quota
+partagé est épuisé.
+
+**Architecture retenue (détail complet dans `DEPLOY_SCALEWAY.md` §
+Multi-fournisseur).** Le choix vit côté navigateur (`sessionStorage`,
+jamais persisté par le serveur), renvoyé à chaque requête ChatKit par les
+en-têtes `X-Provider`/`X-Provider-Api-Key` — patron BYOK déjà documenté dans
+`~/.agents/knowledge/deployment.md`, réutilisé tel quel plutôt que réinventé.
+Première version stockait le choix côté serveur (`Session.provider` +
+endpoint `/settings` séparé) ; simplifiée en cours de route vers le design
+par en-tête, plus robuste (pas de dépendance au `thread_id`, qui n'est pas
+forcément disponible avant le premier message) et plus proche du patron déjà
+éprouvé — refactor fait par un fork, vérifié indépendamment après coup
+(`py_compile` + `grep` de contrôle, rien de résiduel de l'ancien design).
+
+**Nouveau module `app/providers.py`.** `ProviderChoice` + `ContextVar`
+`current_provider`, fixé en tête de `Orchestrator.handle()` et
+`handle_qcm_submit()` à partir de `ctx.request_context`. Les huit classes
+d'agents (`DiagnosticQcmAgent`, `KcEssentialTargetAgent`, `PracticeQcmAgent`,
+`ModuleQcmAgent`, `MicroLessonAgent`, `ExplainMistakeAgent`,
+`LearnerQuestionAgent`, `VisualQuestionAgent`) sont passées d'un `Agent`
+construit une fois pour toutes à l'import à un `_build_agent()` construit à
+la demande depuis le `ContextVar` — mécanique mais touche tout le fichier.
+Modèle OpenAI par classe préservé exactement (`gpt-4.1` pour la plupart,
+`gpt-5.1` pour `ModuleQcmAgent`, `gpt-5.5` pour `VisualQuestionAgent`, cette
+dernière basculée sur `mistral/pixtral-large-latest` côté Mistral pour
+garder la vision). Mistral atteint via l'extension LiteLLM du SDK Agents
+(`openai-agents[litellm]`, ajouté à `requirements.txt`).
+
+**Recherche documentaire hors trajet OpenAI-clé-partagée
+(`app/local_search.py`).** `FileSearchTool` est lié au vector store OpenAI
+privé de ce compte, inaccessible à une clé Mistral ou à une clé OpenAI
+étrangère. Repli sur une recherche BM25 locale (`rank-bm25`), exposée sous
+le nom `file_search` (identique à l'outil OpenAI) pour que les consignes de
+prompt existantes, écrites du temps où il n'y avait qu'un seul fournisseur,
+restent valables sans réécrire les huit blocs d'instructions.
+
+**Découverte en testant : le PDF de doctrine n'a pas de texte
+extractible.** `pypdf` puis `PyMuPDF` (les deux testés) ne récupèrent que
+l'en-tête répété sur les pages de contenu (~41 caractères), jamais le corps
+réel — confirmé en dumpant le texte brut page par page. Le fichier est un
+export de mise en page (« Charte graphique »), pas un PDF à calque texte
+normal. Rendu de page + OCR (Tesseract, `fra`) récupère le vrai contenu,
+vérifié directement : requêtes « LA FORME », « couleur », « pictogramme
+sinistre » passent de 0 résultat à des passages réels et pertinents
+(24 chunks en-tête-seul -> 171 chunks de contenu réel).
+
+**Deuxième découverte, en testant sur le conteneur réel : l'OCR à la volée
+est bien trop lent pour les 140 mvCPU de Scaleway.** Le premier diagnostic
+réel en production est resté figé plusieurs minutes (aucune réponse, aucune
+erreur), alors que le même test tournait en quelques secondes en local
+(CPU du poste, sans commune mesure avec 140 mvCPU). Correctif : l'OCR est
+désormais **précalculé au build Docker** (`app/build_doctrine_index.py`,
+appelé depuis le `Dockerfile` juste après `COPY app /app/app`), le résultat
+baké dans `app/doctrine_chunks.json` — le conteneur déployé ne fait plus
+jamais d'OCR à l'exécution, seulement une lecture de fichier JSON.
+Mémoire du conteneur `api` relevée de 250 à 560 Mo (plafond pour 140 mvCPU)
+par prudence en même temps.
+
+**Troisième découverte, en testant en direct sur `api:v8` (avant le
+correctif OCR, donc confondue un temps avec la lenteur) : Mistral enveloppe
+parfois sa sortie JSON dans un bloc ```` ```json ```` malgré la consigne
+« Return ONLY JSON »**, ce que GPT-4.1 ne fait jamais avec les mêmes
+consignes (comparaison directe faite). Un tour d'appel d'outil se termine
+aussi parfois par une réponse vide, sans exception. Les deux corrigés par
+`providers.py::run_agent_text` (dépouille un bloc de code éventuel, une
+reprise bornée à un essai sur sortie vide), qui remplace l'appel direct à
+`Runner.run` dans les cinq points qui parsent du JSON (diagnostic, pratique
+×2, module, micro-leçon) plus l'extraction de cibles essentielles.
+
+**Message d'erreur utilisateur amélioré.** `providers.py::friendly_llm_error`
+distingue quota dépassé (invite à ouvrir les réglages et ajouter sa clé) de
+clé refusée (invite à vérifier la clé collée), au lieu d'un message
+technique brut ; branché aux deux points d'entrée qui appellent
+l'orchestrateur (`respond()` et l'action `qcm.submit`, cette dernière
+n'avait auparavant AUCUN `try/except`, un appel LLM raté y aurait fait
+remonter une exception non gérée).
+
+**Frontend (`web/src/app/ChatKitComponent.tsx`).** Bouton engrenage à côté
+du bouton « ? » existant, ouvre un panneau avec le menu déroulant (Mistral
+par défaut, GPT-4.1) et un champ mot de passe pour la clé perso, tous deux
+persistés en `sessionStorage` et renvoyés par le wrapper `_fetch` déjà
+existant (qui posait déjà l'en-tête `userId`).
+
+**Validation avant déploiement.** `python3 -m py_compile` propre sur les
+six fichiers backend touchés. `npx tsc --noEmit` et `next build` propres
+côté frontend. Build Docker réel (seule vraie validation vu le venv
+`server/.venv` toujours cassé) : conteneur lancé en local, script de fumée
+exécuté DANS le conteneur pour appeler réellement `DiagnosticQcmAgent`
+via Mistral (gratuit, donc sans les précautions de coût habituelles à ce
+projet) — cycle complet observé : génération → appels `file_search` →
+JSON valide → `normalize_qcm_answers`, avec un vrai aller-retour de
+diagnostic des trois bugs ci-dessus avant d'obtenir un résultat propre.
+
+**Déploiement.** Garde-fou ressources partagées forcé à trois reprises
+(mêmes motifs que les sessions précédentes de ce projet : builds Docker
+courts, empreinte négligeable). `api` -> `:v8` puis `:v9` (après le
+correctif OCR), `web` -> `:v9`. Secret `MISTRAL_API_KEY` ajouté au
+conteneur `api` en plus de `OPENAI_API_KEY` déjà présent (toujours la clé
+partagée « nouveau », la rotation vers une clé dédiée `chatkit-formation-gclab`
+discutée plus tôt dans la journée reste en suspens côté CG).
+
+**Vérification finale en direct (`agent-browser`, site public).** Panneau
+réglages présent et fonctionnel (menu déroulant + champ clé visibles).
+Diagnostic complet de 8 questions généré avec succès via Mistral,
+ancrage doctrinal réel visible dans les questions (« La forme (contour ou
+enveloppe) », « lignes de crête », couleurs par thème). ~3 minutes de bout
+en bout pour les 8 questions (plusieurs appels d'outils séquentiels par
+question) — lent mais fonctionnel, cohérent avec un usage formateur/test
+plutôt qu'un usage à fort trafic. Aucune erreur console JS. Session fermée
+après capture.
+
+**Non fait.** Pas de test réel du trajet GPT-4.1 (aurait coûté, la
+correction du trajet OpenAI n'a pas changé le chemin de code déjà validé
+avant cette séance, seulement sa construction dynamique par
+`_build_agent()`) ; pas de test réel de `VisualQuestionAgent` côté Mistral
+(`mistral/pixtral-large-latest`, jamais exercé en conditions réelles — nom
+de modèle à vérifier si un formateur signale un échec sur l'envoi de photo
+en mode Mistral). Rotation de la clé OpenAI dédiée toujours en attente du
+geste de CG (commande donnée dans la session, jamais confirmée exécutée).

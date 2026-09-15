@@ -17,6 +17,9 @@ type MapState = {
   zoom: number
 } | null
 
+const PROVIDER_STORAGE_KEY = "chatkit-provider"
+const API_KEY_STORAGE_KEY = "chatkit-provider-api-key"
+
 function ChatKitComponent({
   userId,
   theme,
@@ -30,6 +33,53 @@ function ChatKitComponent({
   const [showTour, setShowTour] = useState(true)
   const [tourStep, setTourStep] = useState(0)
   const [showHelpMenu, setShowHelpMenu] = useState(false)
+  const [showSettingsMenu, setShowSettingsMenu] = useState(false)
+  const [provider, setProvider] = useState<string>("mistral")
+  const [apiKey, setApiKey] = useState<string>("")
+
+  // Provider/key choice lives client-side only: sessionStorage (cleared when
+  // the tab closes, never persisted like localStorage would for a public
+  // demonstrator) and resent as headers on every ChatKit request below.
+  // Never sent anywhere except this app's own backend.
+  useEffect(() => {
+    if (typeof window === "undefined") {
+      return
+    }
+    try {
+      const storedProvider = window.sessionStorage.getItem(PROVIDER_STORAGE_KEY)
+      if (storedProvider) {
+        setProvider(storedProvider)
+      }
+      const storedKey = window.sessionStorage.getItem(API_KEY_STORAGE_KEY)
+      if (storedKey) {
+        setApiKey(storedKey)
+      }
+    } catch {
+      // sessionStorage unavailable (private browsing, etc.) -> defaults stand
+    }
+  }, [])
+
+  const updateProvider = useCallback((next: string) => {
+    setProvider(next)
+    try {
+      window.sessionStorage.setItem(PROVIDER_STORAGE_KEY, next)
+    } catch {
+      // ignore: worst case the choice only lasts for this render
+    }
+  }, [])
+
+  const updateApiKey = useCallback((next: string) => {
+    setApiKey(next)
+    try {
+      if (next) {
+        window.sessionStorage.setItem(API_KEY_STORAGE_KEY, next)
+      } else {
+        window.sessionStorage.removeItem(API_KEY_STORAGE_KEY)
+      }
+    } catch {
+      // ignore
+    }
+  }, [])
 
   const docsUrl = `${process.env.NEXT_PUBLIC_CHATKIT_API_URL ?? "http://127.0.0.1:8000"}/static/guide_fr.html`
 
@@ -130,6 +180,8 @@ function ChatKitComponent({
       let requestInit: RequestInit = init ?? {}
       requestInit.headers = {
         userId: userId,
+        "X-Provider": provider,
+        ...(apiKey ? { "X-Provider-Api-Key": apiKey } : {}),
       }
       try {
         const response = await fetch(input, requestInit)
@@ -149,7 +201,7 @@ function ChatKitComponent({
         return buildErrorResponse(errorMessage)
       }
     },
-    [userId],
+    [userId, provider, apiKey],
   )
 
   const chatkit = useChatKit({
@@ -319,6 +371,50 @@ return (
         🧭 Visite guidée
       </button>
     )}
+
+    <div className="absolute right-11 top-3 z-30">
+      <button
+        type="button"
+        aria-label="Réglages du modèle"
+        aria-expanded={showSettingsMenu}
+        onClick={() => setShowSettingsMenu((v) => !v)}
+        className="flex h-6 w-6 items-center justify-center rounded-full bg-slate-900/90 text-[11px] font-semibold text-slate-50 shadow-sm ring-1 ring-slate-700/70 hover:bg-slate-900 dark:bg-slate-800/90 dark:text-slate-100 dark:ring-slate-600/70"
+      >
+        ⚙
+      </button>
+      {showSettingsMenu && (
+        <div className="absolute right-0 mt-1.5 w-64 space-y-2 rounded-xl border border-slate-200 bg-white p-3 text-xs shadow-lg dark:border-slate-700 dark:bg-slate-800">
+          <div>
+            <label className="mb-1 block font-medium text-slate-700 dark:text-slate-200">
+              Modèle
+            </label>
+            <select
+              value={provider}
+              onChange={(e) => updateProvider(e.target.value)}
+              className="w-full rounded-lg border border-slate-300 bg-white px-2 py-1 text-slate-800 dark:border-slate-600 dark:bg-slate-900 dark:text-slate-100"
+            >
+              <option value="mistral">Mistral (par défaut)</option>
+              <option value="openai">GPT-4.1 (OpenAI)</option>
+            </select>
+          </div>
+          <div>
+            <label className="mb-1 block font-medium text-slate-700 dark:text-slate-200">
+              Ma clé API (si plus de quota partagé)
+            </label>
+            <input
+              type="password"
+              value={apiKey}
+              onChange={(e) => updateApiKey(e.target.value)}
+              placeholder="sk-... ou clé Mistral"
+              className="w-full rounded-lg border border-slate-300 bg-white px-2 py-1 text-slate-800 dark:border-slate-600 dark:bg-slate-900 dark:text-slate-100"
+            />
+            <p className="mt-1 text-[10px] text-slate-500 dark:text-slate-400">
+              Conservée dans cet onglet uniquement, envoyée à ce serveur seul.
+            </p>
+          </div>
+        </div>
+      )}
+    </div>
 
     <div className="absolute right-3 top-3 z-30">
       <button
