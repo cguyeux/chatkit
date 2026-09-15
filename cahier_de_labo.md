@@ -832,3 +832,9 @@ crédit) ni de l'envoi de photo en production ; le quiz de reprise reformule
 mais reste proche du premier sur une notion aussi courte que LA FORME ;
 CORS restreint aux deux origines connues, à élargir si un autre domaine
 apparaît. Commits `a0a56c8`, `2f66ea8`, `7a5deb0` poussés sur `fork`.
+
+**Décision CG (18h55).** Code d'accès formateur reporté : le site reste
+ouvert. Ordre retenu pour la prochaine séance : relecture de
+`doctrine_pages.json` avec les formateurs, puis pose du code
+(`ACCESS_CODE` en secret du conteneur `api`, procédure dans
+`DEPLOY_SCALEWAY.md`).
