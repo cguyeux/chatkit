@@ -389,3 +389,44 @@ directement si l'extraction du payload échoue.
 **Validation avant déploiement.** `python3 -m py_compile` propre sur les
 deux fichiers modifiés (venv local `server/.venv` toujours vide/cassé,
 non réparé, hors périmètre — même limite que les sessions précédentes).
+
+**Déploiement.** Garde-fou ressources partagées déclenché (23 sessions
+vivantes, plafond 12, RAM effective 5.8 Gio < plancher) ; mesure réelle
+faite (`agentctl budget` : load1 ~1.8/16, RAM 23.8 Gio dispo) avant de
+forcer, session enregistrée (`agentctl register --name chatkit-fix`),
+tâche déclarée `agentctl task start --force --why` (T61859, 2 Gio/2
+cœurs, ~74s réelles). `api` -> `:v7` (`web` non touché, aucun changement
+frontend). Build Docker, push registre, `scw container container
+update` (repassage `OPENAI_API_KEY`), attente `ready` (~20s).
+
+**Reproduction en direct (agent-browser via `npx agent-browser`, pas
+installé globalement ; site public, pas de Chrome personnel requis).**
+Parcours réel : accueil -> clic « Démarrer le diagnostic » -> QCM de 8
+questions généré (~20s, thème doctrine cartographie opérationnelle
+pompiers) -> 8 réponses cochées en variant délibérément les lettres
+(A,B,C,D,A,B,C,D, sans connaître les bonnes réponses) -> Submit.
+
+**Résultat : correctif confirmé.** Réponse reçue : « Candidate weak KC:
+LA FORME » suivie d'une micro-leçon ciblée sur cette notion (référence
+p.3). Vérification a posteriori sur le contenu de la leçon : la bonne
+réponse à la Q8 (« Quelle variable visuelle détermine l'identité
+graphique principale d'un objet ? ») est explicitement « La forme »
+(choix A) — j'avais coché D (« L'orientation »), donc une vraie erreur
+sur la KC en question ; de même Q1 attendait « Étoile » (B) et j'avais
+coché A (« Carré »), Q1 et Q8 relevant tous deux de la même KC
+« LA FORME ». Le diagnostic a donc correctement discriminé une KC
+réellement ratée parmi 8 questions aux réponses volontairement
+mélangées, à l'opposé exact du symptôme « 0 partout » rapporté par
+Yvon : la comparaison LLM-answer / choix-utilisateur fonctionne de
+nouveau. Aucune erreur console JS, aucun `IntegrationError` (vérifié
+via `agent-browser console`). Session `agent-browser` fermée après
+capture.
+
+**Dette documentaire corrigée.** `DEPLOY_SCALEWAY.md` : image `api`
+`:v6` -> `:v7`.
+
+**Non fait.** Pas de réponse envoyée à Yvon sur Slack (hors périmètre
+technique, laissé à l'utilisateur). Logs Scaleway (`print()` ajoutés)
+non consultés faute d'accès CLI aux logs de conteneurs — seule la
+console Scaleway les montrerait ; non nécessaire, la reproduction a
+validé le correctif directement par son résultat fonctionnel.
