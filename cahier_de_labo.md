@@ -596,3 +596,55 @@ avant cette séance, seulement sa construction dynamique par
 de modèle à vérifier si un formateur signale un échec sur l'envoi de photo
 en mode Mistral). Rotation de la clé OpenAI dédiée toujours en attente du
 geste de CG (commande donnée dans la session, jamais confirmée exécutée).
+
+---
+
+## 2026-09-15 15h15 — CG ne voyait pas le sélecteur : cache HTML d'un an trouvé, erreur JSON en prod non reproduite
+
+**Signalement.** CG, après un rechargement forcé et un onglet privé, ne
+voyait toujours pas le sélecteur, et obtenait « ⚠️ Erreur interne (Mistral) :
+Expecting value: line 1 column 1 (char 0) » sur un diagnostic.
+
+**Deux problèmes distincts, pas un seul.**
+
+**1) Cache HTML réel, indépendant du navigateur — confirmé et corrigé.**
+`curl -I https://formation.gclab.fr/` montrait
+`cache-control: s-maxage=31536000` (un an), défaut Next.js pour une page
+entièrement statique (`web/src/app/page.tsx`), sans aucune config de
+revalidation explicite. Un rechargement forcé ne contourne PAS un cache
+d'infrastructure en amont du navigateur — c'est précisément pourquoi ni le
+hard refresh ni l'onglet privé n'ont rien changé. Correctif :
+`web/next.config.ts`, `headers()` pose `Cache-Control: no-store,
+must-revalidate` sur `/` uniquement (les chunks `_next/static/` gardent
+leur cache normal, sans risque, noms de fichiers hachés par contenu).
+Vérifié après déploiement : l'en-tête vaut désormais bien `no-store`.
+
+**2) Erreur JSON en production — NON reproduite malgré 12 essais réels
+contre l'image exacte de prod (`api:v9` repullée depuis le registre).**
+3 essais du chemin direct (`Runner.run` + prompt manuel) et 3 essais du
+vrai chemin `agent.generate()`, tous avec fence markdown correctement
+dépouillé, tous aboutis. Hypothèse la plus probable, non confirmée : mes
+propres essais de diagnostic tournaient EN PARALLÈLE de la tentative
+réelle de CG, sur la même clé Mistral gratuite partagée — un vrai
+rate-limit de leur côté produirait exactement ce symptôme (réponse vide,
+aucune exception explicite) sans laisser de trace distinguable a
+posteriori. Conteneur de test arrêté dès ce constat pour ne plus
+contribuer à la contention pendant que CG teste.
+
+**Durcissement appliqué quand même, indépendamment de la cause exacte**
+(`providers.py`). `strip_code_fence` passe de `re.match` (ancré début/fin)
+à `re.search` : un préambule avant le bloc ```` ```json ```` (le modèle
+écrit parfois une phrase avant le JSON) ne fait plus échouer l'extraction.
+`run_agent_text` : la condition de succès n'est plus « non vide » mais
+« non vide ET commence par `[` ou `{` » (`_looks_like_json`), et les
+reprises passent de 1 à 2 (3 essais au total). Paramètre `expect_json`
+ajouté pour un futur appelant texte-libre qui ne voudrait pas de cette
+contrainte.
+
+**Déploiement.** `api` -> `:v10`, `web` -> `:v10`. Les deux `ready`,
+vérifiés.
+
+**Non fait.** Cause racine de l'erreur JSON ponctuelle non confirmée
+(non reproduite) ; le durcissement réduit la probabilité de récidive sans
+prouver qu'il l'aurait empêchée cette fois précisément. À surveiller si ça
+se reproduit alors qu'aucun test local ne tourne en parallèle.

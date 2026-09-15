@@ -69,7 +69,7 @@ def build_model_settings(choice: ProviderChoice) -> ModelSettings:
     return ModelSettings()
 
 
-_CODE_FENCE_RE = re.compile(r"^```(?:json)?\s*\n?(.*?)\n?```\s*$", re.DOTALL)
+_CODE_FENCE_RE = re.compile(r"```(?:json)?\s*\n?(.*?)\n?```", re.DOTALL)
 
 
 def strip_code_fence(text: str) -> str:
@@ -77,25 +77,33 @@ def strip_code_fence(text: str) -> str:
     fences", but Mistral (unlike GPT-4.1 with the same instructions, both
     tested live 2026-09-15) still sometimes wraps its answer in a ```json
     ... ``` block, which breaks every json.loads() call site outright
-    (JSONDecodeError: Expecting value at char 0). Strip it defensively rather
-    than trusting the instruction."""
-    match = _CODE_FENCE_RE.match(text.strip())
-    return match.group(1).strip() if match else text
+    (JSONDecodeError: Expecting value at char 0). `search` (not `match`) on
+    purpose: a stray preamble before the fence ("Voici les questions :")
+    must not defeat the extraction. Strip it defensively rather than
+    trusting the instruction."""
+    match = _CODE_FENCE_RE.search(text)
+    return match.group(1).strip() if match else text.strip()
 
 
-async def run_agent_text(agent: Any, prompt: Any, ctx: Any, *, retries: int = 1) -> str:
+def _looks_like_json(text: str) -> bool:
+    return text[:1] in ("[", "{")
+
+
+async def run_agent_text(agent: Any, prompt: Any, ctx: Any, *, retries: int = 2, expect_json: bool = True) -> str:
     """Runner.run wrapper: strips an accidental markdown code fence from the
-    output (see strip_code_fence) and retries once on a genuinely blank
-    final_output, reproduced live on the free Mistral tier after a
-    tool-calling turn. Bounded on purpose: a mitigation for an observed
-    flake, not a general-purpose resilience loop."""
+    output (see strip_code_fence) and retries on a blank or non-JSON-looking
+    final_output, reproduced live on the free Mistral tier (a tool-calling
+    turn ending with an empty response, no exception). Bounded on purpose: a
+    mitigation for an observed flake, not a general-purpose resilience loop.
+    Pass expect_json=False for a plain-text caller that shouldn't reject a
+    normal blank/short response as a retry trigger."""
     from agents import Runner
 
     raw = ""
     for _ in range(retries + 1):
         res = await Runner.run(agent, prompt, context=ctx)
         raw = strip_code_fence((res.final_output or "").strip())
-        if raw:
+        if raw and (not expect_json or _looks_like_json(raw)):
             return raw
     return raw
 
