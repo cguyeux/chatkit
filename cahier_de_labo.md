@@ -648,3 +648,107 @@ vérifiés.
 (non reproduite) ; le durcissement réduit la probabilité de récidive sans
 prouver qu'il l'aurait empêchée cette fois précisément. À surveiller si ça
 se reproduit alors qu'aucun test local ne tourne en parallèle.
+
+---
+
+## 2026-09-15 15h30 — Audit de l'expérience et du comportement du chatbot, pistes d'amélioration
+
+**Demande.** CG demande des pistes pour améliorer le chatbot de
+formation.gclab.fr : expérience utilisateur, comportement et qualité.
+Séance de lecture seule, aucun fichier de code modifié, aucun
+déploiement.
+
+**Méthode.** Lecture intégrale de `orchestrator.py` (2982 lignes),
+`chatkit_server.py`, `providers.py`, `local_search.py`, `main.py`,
+`data_store.py`, du front (`ChatKitComponent.tsx`, `page.tsx`,
+`GuidedTour.tsx`), du graphe `kc_graph1.json` (32 KC, 8 modules, 4
+unités, 23 pages) et des trois dernières entrées du cahier. Lecture des
+fiches KB `llm-app-observabilite.md` et `deployment.md` (entrées chatkit
+et BYOK).
+
+**Constats vérifiés dans le code (défauts, pas des goûts).**
+
+1. Langue et jargon : formulaire de leçon rendu avec des libellés anglais
+   (`_format_lesson_form` : « PDF basis », « Objective », « Rule to
+   remember »), messages de flux en anglais (« Candidate weak KC »,
+   « Validated KC », « Type: next », « Diagnostic screening result: this
+   quiz identifies… »), indices en français sans accents, et le mot
+   « KC » exposé partout au stagiaire. Seuls `ExplainMistakeAgent` et
+   `VisualQuestionAgent` imposent le français ; les cinq agents
+   générateurs de QCM et de leçons n'ont aucune consigne de langue.
+2. Diagnostic tronqué : `_kc_nodes_for_diagnostic` prend les 8 premières
+   KC de l'ordre pédagogique sur 32, avec 8 questions, soit une question
+   par KC. Les 24 KC restantes ne sont jamais sondées, et la faiblesse
+   détectée repose sur une seule question. Le parcours est ensuite
+   linéaire depuis la KC faible : les KC antérieures restent à 0 au
+   radar.
+3. Coercition dangereuse de la réponse LLM : `_coerce_qcm_answer_letter`
+   cherche la première lettre A-D dans le texte et renvoie « A » sinon.
+   Une réponse donnée sous forme de texte (« Carré », « Bleu ») devient
+   la lettre « C » ou « B » sans rapport avec la bonne option, et une
+   réponse illisible devient « A ». Le stagiaire est alors corrigé à
+   tort. Pas de schéma de sortie structuré sur aucun agent.
+4. Repli mensonger : `_start_practice` sert un QCM factice (« Fallback
+   question (model output invalid) », options A-D, réponse A) quand le
+   modèle échoue, au lieu de le dire.
+5. État volatil : `MyDataStore` et `Orchestrator._sessions` sont en
+   mémoire, `evidence_log.jsonl` sur le disque du conteneur ; le
+   conteneur Scaleway est scale-to-zero. Un formateur qui revient le
+   lendemain repart de zéro, et les traces d'usage disparaissent. Le
+   `userId` côté navigateur, lui, persiste (localStorage), donc la
+   persistance serveur suffirait. La maîtrise est en outre indexée par
+   fil de discussion, pas par utilisateur.
+6. Question libre impossible pendant un QCM ou avant le diagnostic :
+   `handle()` renvoie l'aide dès que `phase == "waiting_answers"` ou
+   qu'aucune KC n'est sélectionnée. `LearnerQuestionAgent` refuse en
+   plus toute notion « future », ce qui bloque un pompier qui veut juste
+   identifier un symbole.
+7. Pas de corrigé : après soumission, le stagiaire ne voit jamais
+   question par question ce qu'il a coché et la bonne réponse, seulement
+   une explication en prose limitée aux 5 premières erreurs ; en cas de
+   réussite, rien du tout. Les indices (`_build_hint_ladder`) sont des
+   gabarits génériques, pas liés à la question ratée.
+8. Latence structurelle : chaque génération laisse le LLM appeler
+   `file_search` séquentiellement (~3 min pour 8 questions sur Mistral,
+   mesuré le 2026-09-15), alors que chaque KC tient sur une page connue
+   (`pages` dans le graphe) et que l'OCR est déjà précalculé : le texte
+   de la page pourrait être injecté directement. La pratique enchaîne
+   jusqu'à trois appels (cibles, génération, réparation) ; les leçons
+   « first_exposure » et les cibles essentielles ne dépendent pas de
+   l'apprenant et pourraient être précalculées.
+9. Front : visite guidée réaffichée à chaque chargement (`showTour`
+   non persisté) ; commandes à taper en anglais (« practice », « next »,
+   « hint ») et suggestion de départ qui envoie « start diagnostic » en
+   clair dans le fil ; volet droit en `w-1/2` non adapté au mobile ;
+   pouces de feedback ChatKit activés mais aucun gestionnaire serveur,
+   donc retour perdu ; toute erreur HTTP recouvre le chat d'un écran
+   « n'a pas pu se charger » avec rechargement forcé.
+10. Sécurité et coût : CORS ouvert, aucun code d'accès, clés partagées
+    derrière un endpoint public (déjà noté dans la KB deployment.md).
+11. Granularité du seuil : 70 % avec un QCM pouvant compter 2 questions,
+    donc une erreur sur deux échoue, et 2/3 aussi.
+12. Ancrage textuel seul : le mémento est une charte visuelle (formes,
+    couleurs, symboles) ; l'index BM25 ne porte que le texte OCR, aucune
+    question ne montre un symbole.
+
+**Pistes proposées à CG (détail dans la réponse de séance, résumé ici).**
+A. Vitrine stagiaire : franciser et débarrasser du jargon, boutons
+d'action à la place des commandes, corrigé question par question, visite
+guidée mémorisée, mobile, erreurs non bloquantes.
+B. Fiabilité et vitesse : sorties structurées (schéma JSON / Pydantic),
+injection directe du texte de page, parallélisation, cache des contenus
+indépendants de l'apprenant, repli honnête, persistance des sessions et
+des traces.
+C. Pédagogie : diagnostic couvrant tout le cours, parcours en file des
+notions faibles, seuil et longueur minimale cohérents, radar montrant
+estimé vs validé, indices spécifiques, questions visuelles avec image
+de symbole, mode question libre.
+D. Outillage formateur : banque de questions générées hors ligne puis
+validées par les formateurs et servie sans LLM, signalement d'une
+question depuis le widget, évaluation hors ligne de la qualité
+(ancrage, distribution des lettres, doublons), tableau de bord des
+questions les plus ratées, code d'accès et quota.
+
+**Décision attendue.** Choix par CG des axes à lancer ; rien n'est
+engagé. Aucune piste n'est validée par un test, ce sont des lectures de
+code.

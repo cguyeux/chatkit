@@ -2,89 +2,74 @@
 
 import { ColorScheme } from "@openai/chatkit-react"
 import ChatKitComponent from "./ChatKitComponent"
-import { useState, useEffect } from 'react'
+import { useState, useEffect } from "react"
 
 const USERID_STORAGE_KEY = "userId"
+const THEME_STORAGE_KEY = "chatkit-theme"
+
+function readStorage(key: string): string | null {
+  try {
+    return window.localStorage.getItem(key)
+  } catch {
+    return null
+  }
+}
+
+function writeStorage(key: string, value: string): void {
+  try {
+    window.localStorage.setItem(key, value)
+  } catch (error) {
+    console.error("Failed to persist", key, error)
+  }
+}
 
 export default function Home() {
-    // A free-form string that identifies the end user
-    // ensures this Session can access other objects that have the same user scope.
-    const [userId, setUserId] = useState<string | null>(null)
-    const [theme, setTheme] = useState<ColorScheme>("dark")
-    const [maximize, setMax] = useState<boolean>(true)
+  // A free-form string that identifies the end user across visits (same
+  // learner state server-side as long as the browser keeps it).
+  const [userId, setUserId] = useState<string | null>(null)
+  const [theme, setTheme] = useState<ColorScheme>("light")
 
-    function readUserId(): string | null {
-        if (typeof window === "undefined") {
-            return null
-        }
-        try {
-            return window.localStorage.getItem(USERID_STORAGE_KEY)
-        } catch (error) {
-            return null
-        }
+  useEffect(() => {
+    const existing = readStorage(USERID_STORAGE_KEY)
+    if (existing === null) {
+      const id = crypto.randomUUID()
+      setUserId(id)
+      writeStorage(USERID_STORAGE_KEY, id)
+    } else {
+      setUserId(existing)
     }
-
-    function persistUserId(id: string): void {
-        if (typeof window === "undefined") {
-            return
-        }
-        try {
-            window.localStorage.setItem(USERID_STORAGE_KEY, id)
-        } catch (error) {
-            console.error("Failed to persist userid", error)
-        }
+    const storedTheme = readStorage(THEME_STORAGE_KEY)
+    if (storedTheme === "dark" || storedTheme === "light") {
+      setTheme(storedTheme)
     }
+  }, [])
 
-    useEffect(() => {
-        if (typeof window === "undefined") {
-            return
-        }
+  const toggleTheme = () => {
+    setTheme((v) => {
+      const next: ColorScheme = v === "dark" ? "light" : "dark"
+      writeStorage(THEME_STORAGE_KEY, next)
+      return next
+    })
+  }
 
-        const existing = readUserId()
-        console.log("exisitng: ", existing)
-        if (existing === null) {
-            const id = crypto.randomUUID()
-            setUserId(id)
-            persistUserId(id)
-        } else {
-            setUserId(existing)
-        }
-    }, [(typeof window)])
-
-    return (
-        <main className="flex min-h-screen flex-col items-center justify-end bg-slate-100 dark:bg-slate-950">
-            <div className="m-auto w-full h-[90vh] max-w-4xl flex flex-col">
-                <div className="justify-end w-full flex flex-row py-2 gap-2">
-                    <button
-                        type="button"
-                        className="rounded-lg bg-slate-900 px-4 py-2 text-sm font-semibold text-white hover:bg-slate-800 dark:bg-slate-100 dark:text-slate-900 dark:hover:bg-slate-200 max-w-fit pointer-events-auto"
-                        onClick={() => setMax((v) => {
-                            return !v
-                        })}>
-                        {maximize ? "Vue partagée" : "Plein écran"}
-                    </button>
-
-                    <button
-                        type="button"
-                        className="rounded-lg bg-slate-900 px-4 py-2 text-sm font-semibold text-white hover:bg-slate-800 dark:bg-slate-100 dark:text-slate-900 dark:hover:bg-slate-200 max-w-fit pointer-events-auto"
-                        onClick={() => setTheme((v) => {
-                            return v === "dark" ? "light" : "dark"
-                        })}>
-                        {theme === "dark" ? "Mode clair" : "Mode sombre"}
-                    </button>
-                </div>
-                {
-                    userId === null ? null : <ChatKitComponent
-                        userId={userId}
-                        theme={theme}
-                        maximize={maximize}
-                        onResponseEnd={() => {
-                            console.log("Response finished")
-                        }}
-                    />
-                }
-
-            </div>
-        </main>
-    )
+  return (
+    <main
+      className={`flex min-h-screen flex-col items-center bg-slate-100 dark:bg-slate-950 ${
+        theme === "dark" ? "dark" : ""
+      }`}
+    >
+      <div className="mx-auto flex h-[100dvh] w-full max-w-4xl flex-col px-2 py-2 sm:px-4">
+        <div className="flex w-full flex-row flex-wrap items-center justify-end gap-2 pb-2">
+          <button
+            type="button"
+            className="rounded-lg bg-slate-900 px-3 py-1.5 text-xs font-semibold text-white hover:bg-slate-800 dark:bg-slate-100 dark:text-slate-900 dark:hover:bg-slate-200"
+            onClick={toggleTheme}
+          >
+            {theme === "dark" ? "Mode clair" : "Mode sombre"}
+          </button>
+        </div>
+        {userId === null ? null : <ChatKitComponent userId={userId} theme={theme} />}
+      </div>
+    </main>
+  )
 }

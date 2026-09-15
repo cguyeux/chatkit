@@ -105,13 +105,51 @@ clé API si le quota partagé est épuisé.
   (dépouille un éventuel bloc de code, une reprise bornée à 1 essai sur
   sortie vide), utilisé par tous les générateurs qui parsent du JSON.
 
+## Refonte du 2026-09-15 (quatre axes : vitrine, fiabilité, pédagogie, outillage formateur)
+
+Détail des motifs dans le cahier de labo (entrées du 2026-09-15). Ce qui change pour le déploiement :
+
+- **Ancrage doctrinal** : `server/app/doctrine_pages.json` (transcription structurée des 24 pages
+  par un modèle de vision, `transcribe_pages.py`, à relire par les formateurs) est **commité** et
+  chargé en priorité par `content.py` ; l'OCR Tesseract (`doctrine_chunks.json`) et les images de
+  page (`pages/*.png`) restent générés au build par `build_doctrine_index.py`. Plus aucun outil
+  `file_search` sur le trajet Mistral : le texte des pages est injecté dans les prompts.
+- **Persistance** : sessions apprenant, fils ChatKit, journal d'événements et cache de contenu vont
+  dans un bucket Object Storage (`storage.py`). Variables secrètes du conteneur `api` :
+  `STATE_S3_BUCKET=chatkit-formation-state`, `STATE_S3_ENDPOINT=https://s3.fr-par.scw.cloud`,
+  `STATE_S3_REGION=fr-par`, `STATE_S3_ACCESS_KEY`, `STATE_S3_SECRET_KEY` (application IAM
+  `chatkit-api-storage`, politique ObjectStorageFullAccess sur le projet, clé expirant le
+  2027-09-15 ; valeurs dans `~/.config/chatkit/scw_storage.env`, jamais dans le dépôt). Sans ces
+  variables, repli sur un répertoire local (`STATE_LOCAL_DIR`, perdu au scale-to-zero).
+- **Code d'accès formateur** : `ACCESS_CODE=<code>` (secret) exige l'en-tête `X-Access-Code` sur
+  `/chatkit`, `/progress` et l'upload ; le front affiche une porte de saisie. Vide = accès libre.
+- **CORS** : `ALLOWED_ORIGINS=https://formation.gclab.fr,https://chatkitf92c84e6-web.functions.fnc.fr-par.scw.cloud`
+  (défaut `*` si absent).
+- **Modèles** : `MISTRAL_MODEL` (défaut `mistral/mistral-large-latest`), `MISTRAL_VISION_MODEL`
+  (défaut idem : `pixtral-large-latest` a été retiré par Mistral, « Invalid model » le 2026-09-15),
+  `OPENAI_MODEL` (défaut `gpt-4.1`). **Le compte OpenAI n'a plus de crédit au 2026-09-15**
+  (`credit_balance_exhausted`) : le second choix du sélecteur ne fonctionne qu'avec une clé
+  personnelle tant que CG n'a pas rechargé.
+- **Quota par apprenant** : `MAX_GENERATIONS_PER_DAY` (défaut 150) ; `LLM_CONCURRENCY` (défaut 2,
+  palier gratuit Mistral ~1 req/s) ; `DIAGNOSTIC_Q_NUM` (défaut 10), `PRACTICE_MIN_Q` (4).
+- **Endpoints ajoutés** : `GET /health` (état, source doctrinale, backend de stockage, taille de la
+  banque), `GET /progress` (barre d'état du front).
+- **Outillage formateur** (`server/app/`, hors ligne, dans l'image ou en local avec `PYTHONPATH=server`) :
+  `generate_bank.py` (candidats de questions vers un xlsx à relire), `import_bank.py` (lignes
+  « validé » vers `question_bank.json` et/ou la clé `bank/questions.json` du bucket, servie sans
+  rebuild), `trainer_report.py` (apprenants, taux de réussite par notion, questions les plus
+  ratées, signalements, pouces), `eval_generation.py` (validité, distribution des lettres,
+  doublons, ancrage jugé, latence, par fournisseur), `smoke_its.py` (parcours complet contre
+  l'orchestrateur réel, à lancer dans l'image avec `MISTRAL_API_KEY`).
+
 ## Build + déploiement (rappel)
 
 Backend :
 ```
 cd server && docker build --network=host -f Dockerfile -t chatkit-api:latest .
 docker tag chatkit-api:latest rg.fr-par.scw.cloud/chatkit/api:vN && docker push rg.fr-par.scw.cloud/chatkit/api:vN
-scw container container update c109d80e-c82f-413c-9381-974304611cf0 image=rg.fr-par.scw.cloud/chatkit/api:vN region=fr-par secret-environment-variables.OPENAI_API_KEY="$OPENAI_API_KEY" secret-environment-variables.MISTRAL_API_KEY="$MISTRAL_API_KEY"
+set -a; source ~/.config/chatkit/scw_storage.env; set +a
+scw container container update c109d80e-c82f-413c-9381-974304611cf0 image=rg.fr-par.scw.cloud/chatkit/api:vN region=fr-par secret-environment-variables.OPENAI_API_KEY="$OPENAI_API_KEY" secret-environment-variables.MISTRAL_API_KEY="$MISTRAL_API_KEY" secret-environment-variables.STATE_S3_ACCESS_KEY="$STATE_S3_ACCESS_KEY" secret-environment-variables.STATE_S3_SECRET_KEY="$STATE_S3_SECRET_KEY" environment-variables.STATE_S3_BUCKET=chatkit-formation-state environment-variables.STATE_S3_ENDPOINT=https://s3.fr-par.scw.cloud environment-variables.STATE_S3_REGION=fr-par environment-variables.PUBLIC_BASE_URL=https://chatkitf92c84e6-api.functions.fnc.fr-par.scw.cloud
 scw container container redeploy c109d80e-c82f-413c-9381-974304611cf0 region=fr-par
 ```
 

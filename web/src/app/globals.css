@@ -1,5 +1,9 @@
 @import "tailwindcss";
 
+/* The dark variant follows the in-app toggle (a `dark` class on <main>),
+   not only the OS preference, so the chrome matches the ChatKit theme. */
+@custom-variant dark (&:where(.dark, .dark *));
+
 :root {
   --background: #ffffff;
   --foreground: #171717;

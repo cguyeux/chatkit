@@ -6,3 +6,5 @@ pymupdf
 pytesseract
 pillow
 rank-bm25
+boto3
+openpyxl

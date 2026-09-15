@@ -231,7 +231,7 @@ def evaluate(events: list[dict[str, Any]]) -> dict[str, Any]:
         if event.get("source_pages"):
             grounded_lessons += 1
         text = str(event.get("lesson_text") or event.get("lesson_preview") or "")
-        if "PDF basis:" in text:
+        if "PDF basis:" in text or "Source :" in text or "À retenir" in text:
             lesson_pdf_basis_ok += 1
         elif text:
             issues.append({

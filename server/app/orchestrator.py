@@ -1,84 +1,155 @@
 # app/orchestrator.py
+"""Intelligent tutoring workflow for the memento GOC (sapeurs-pompiers).
+
+Rewritten 2026-09-15 (cahier de labo, audit of the same day). What changed
+and why, in one place:
+
+- French everywhere the learner reads, no "KC"/"module" jargon: « notion » and
+  « chapitre ». Commands are French with English aliases, and every step ends
+  with action BUTTONS (widgets) so nobody has to type "practice".
+- Grounding by prompt injection (content.py): the memento fits in a prompt, so
+  no tool loop; one round trip per generation instead of minutes.
+- Typed outputs (schemas.py): the answer key is resolved against the choices,
+  choices are shuffled, unusable questions are dropped, never defaulted to A.
+- Diagnostic samples the WHOLE course (one question per sampled notion across
+  every chapter) and builds a queue of weak notions; before it only looked at
+  the first eight notions.
+- Answer sheet (corrigé) after every quiz, question by question, with the
+  justification generated with the question (no extra call), and a
+  « Signaler » button per question feeding the trainers.
+- Specific hints generated from the actual mistakes; remediation lesson only
+  when the score is really low (< 50 %), otherwise feedback + hints.
+- Free questions accepted at any time (even with a quiz pending), on the
+  whole memento; notions that come later are flagged, not refused.
+- Validated question bank served without any model call when available.
+- State keyed by learner (userId) and persisted (storage.py), so a trainer
+  who comes back the next day resumes where they stopped.
+- Honest failure: when the model fails, say so and offer to retry; no fake
+  quiz.
+
+Evidence events keep the names and key fields benchmark_runner.py reads."""
 from __future__ import annotations
 
-import os
+import asyncio
 import json
+import os
+import random
 import re
-from datetime import datetime, timezone
-from urllib.parse import quote
-from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Tuple
+import unicodedata
+import uuid
+from contextvars import ContextVar
+from dataclasses import asdict, dataclass, field, fields
+from datetime import date, datetime, timezone
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 
-from agents import Agent, Runner
 from chatkit.agents import AgentContext
-from app.viz.radar_html import build_radar_dashboard_html
+
+from app.bank import QuestionBank
+from app.content import doctrine
 from app.providers import (
-    DEFAULT_PROVIDER,
-    KNOWN_PROVIDERS,
-    ProviderChoice,
-    build_model,
-    build_model_settings,
-    build_tools,
+    friendly_llm_error,
+    provider_label,
+    run_structured,
+    run_text,
+    set_provider_from_context,
     current_provider,
-    run_agent_text,
 )
+from app.schemas import LETTERS, EssentialTargets, Feedback, LessonOut, PracticePack, QcmList, normalize_questions
+from app.storage import store
+from app.viz.radar_html import build_radar_dashboard_html
+from app.widgets import its_widgets as W
 
 # =====================================================
 # CONFIG
-# ===================================================== VECTOR_STORE_ID moved to app/providers.py
-# Public base URL of THIS backend (used to build absolute links to /static PDFs).
-# Overridden at deploy time with the container's public endpoint.
+# =====================================================
 PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "http://127.0.0.1:8000").rstrip("/")
 KC_GRAPH_PATH = os.getenv("KC_GRAPH_PATH", os.path.join(os.path.dirname(__file__), "kc_graph1.json"))
+USER_ID_KEY = "userId"
 
-DIAGNOSTIC_Q_NUM = int(os.getenv("DIAGNOSTIC_Q_NUM", "8"))# global diagnostic length
-"""   
-PRACTICE_Q_NUM = int(os.getenv("PRACTICE_Q_NUM", "3"))       # per-KC practice length""" 
-THRESHOLD = float(os.getenv("MASTERY_THRESHOLD", "0.7"))     # pass threshold (0..1)
-
-PRACTICE_MIN_Q = int(os.getenv("PRACTICE_MIN_Q", "2"))
-PRACTICE_MAX_Q = int(os.getenv("PRACTICE_MAX_Q", "14"))
+DIAGNOSTIC_Q_NUM = int(os.getenv("DIAGNOSTIC_Q_NUM", "10"))
+THRESHOLD = float(os.getenv("MASTERY_THRESHOLD", "0.7"))
+PRACTICE_MIN_Q = int(os.getenv("PRACTICE_MIN_Q", "4"))
+PRACTICE_MAX_Q = int(os.getenv("PRACTICE_MAX_Q", "8"))
 MODULE_THRESHOLD = float(os.getenv("MODULE_THRESHOLD", "0.7"))
-MODULE_MIN_Q = int(os.getenv("MODULE_MIN_Q", "8"))
-MODULE_MAX_Q = int(os.getenv("MODULE_MAX_Q", "20"))
+MODULE_MIN_Q = int(os.getenv("MODULE_MIN_Q", "6"))
+MODULE_MAX_Q = int(os.getenv("MODULE_MAX_Q", "12"))
 DIAGNOSTIC_MIN_MASTERY = float(os.getenv("DIAGNOSTIC_MIN_MASTERY", "0.25"))
 DIAGNOSTIC_MAX_MASTERY = float(os.getenv("DIAGNOSTIC_MAX_MASTERY", "0.55"))
-EVIDENCE_LOG_PATH = os.getenv(
-    "EVIDENCE_LOG_PATH",
-    os.path.join(os.path.dirname(__file__), "evidence_log.jsonl"),
-)
+REMEDIATION_LESSON_BELOW = float(os.getenv("REMEDIATION_LESSON_BELOW", "0.5"))
+MAX_GENERATIONS_PER_DAY = int(os.getenv("MAX_GENERATIONS_PER_DAY", "150"))
+EVIDENCE_LOG_PATH = os.getenv("EVIDENCE_LOG_PATH", os.path.join(os.path.dirname(__file__), "evidence_log.jsonl"))
 QCM_PROMPT_MAX_CHARS = int(os.getenv("QCM_PROMPT_MAX_CHARS", "240"))
 QCM_CHOICE_MAX_CHARS = int(os.getenv("QCM_CHOICE_MAX_CHARS", "90"))
 
-# Trigger phrases for the three slow, LLM-backed content-generation actions.
-# Shared between handle()'s dispatch and Orchestrator.peek_transition_message(),
-# which announces the wait before the generation actually starts.
-START_DIAGNOSTIC_TRIGGERS = {"start diagnostic", "diagnostic", "start"}
-PRACTICE_TRIGGERS = {"practice", "practice qcm", "qcm"}
-NEXT_KC_TRIGGERS = {"next", "next kc", "continue"}
+ProgressFn = Callable[[str, str], None]
+_progress_cv: ContextVar[Optional[ProgressFn]] = ContextVar("its_progress", default=None)
+
+
+def _progress(text: str, icon: str = "sparkle") -> None:
+    fn = _progress_cv.get()
+    if fn:
+        try:
+            fn(text, icon)
+        except Exception:
+            pass
+
 
 # =====================================================
-# HELPERS (extract latest user message text)
+# COMMANDS (French first, English aliases kept)
 # =====================================================
+def _fold(text: str) -> str:
+    text = unicodedata.normalize("NFKD", str(text or ""))
+    text = "".join(ch for ch in text if not unicodedata.combining(ch))
+    text = re.sub(r"[^a-z0-9]+", " ", text.lower())
+    return text.strip()
+
+
+COMMANDS: Dict[str, set] = {
+    "start": {"commencer le diagnostic", "commencer", "diagnostic", "demarrer le diagnostic", "start diagnostic", "start", "lancer le diagnostic"},
+    "practice": {"quiz", "lancer le quiz", "refaire le quiz", "m entrainer", "entrainement", "practice", "practice qcm", "qcm", "un quiz", "nouveau quiz"},
+    "hint": {"indice", "un indice", "hint", "next hint", "indice suivant"},
+    "next": {"notion suivante", "suivant", "suivante", "continuer", "next", "next kc", "passer a la suite"},
+    "progress": {"ma progression", "progression", "radar", "ou en suis je", "show radar", "evaluation radar", "mon avancement"},
+    "help": {"aide", "help", "guide", "commands", "commandes", "que puis je faire"},
+    "lesson": {"revoir la lecon", "la lecon", "lecon", "relire la lecon", "lesson"},
+    "checkpoint": {"controle", "refaire le controle", "controle de chapitre", "checkpoint", "retry", "module quiz"},
+    "clear_image": {"oublier l image", "oublier la photo", "clear image", "forget image", "new image"},
+    "reset": {"recommencer a zero", "recommencer", "tout effacer", "reset"},
+    "reset_confirm": {"oui tout effacer", "reset confirm", "confirmer la remise a zero"},
+    "cancel": {"non", "annuler", "cancel", "non garder"},
+    "debug": {"debug its", "its debug", "show its state", "debug mastery", "show mastery"},
+}
+_COMMAND_INDEX: Dict[str, str] = {alias: cmd for cmd, aliases in COMMANDS.items() for alias in aliases}
+SLOW_COMMANDS = {"start", "practice", "next", "checkpoint", "lesson"}
+
+
+def classify_command(text: str) -> Optional[str]:
+    return _COMMAND_INDEX.get(_fold(text))
+
+
+def looks_like_answers(text: str) -> bool:
+    return bool(re.search(r"\b\d+\s*[A-D]\b", text.upper())) and len(text) < 120
+
+
+def parse_answers_from_text(text: str) -> Dict[int, str]:
+    out: Dict[int, str] = {}
+    for m in re.finditer(r"\b(\d+)\s*([A-D])\b", text.upper().replace(",", " ")):
+        out[int(m.group(1))] = m.group(2)
+    return out
+
+
 def extract_latest_user_text(input_items: Any) -> str:
-    """
-    input_items is produced by ThreadItemConverter.to_agent_input(items).
-    It's typically a list of message dicts with content blocks.
-    """
     if isinstance(input_items, list):
         for msg in reversed(input_items):
-            if not isinstance(msg, dict):
-                continue
-            if msg.get("role") != "user":
+            if not isinstance(msg, dict) or msg.get("role") != "user":
                 continue
             blocks = msg.get("content", [])
-            if not isinstance(blocks, list):
-                continue
-            for b in blocks:
-                if isinstance(b, dict) and b.get("type") == "input_text":
-                    t = (b.get("text") or "").strip()
-                    if t:
-                        return t
+            if isinstance(blocks, list):
+                for b in blocks:
+                    if isinstance(b, dict) and b.get("type") == "input_text":
+                        t = (b.get("text") or "").strip()
+                        if t:
+                            return t
             return ""
     return str(input_items or "").strip()
 
@@ -87,103 +158,40 @@ def extract_latest_user_image_urls(input_items: Any) -> List[str]:
     if not isinstance(input_items, list):
         return []
     for msg in reversed(input_items):
-        if not isinstance(msg, dict):
-            continue
-        if msg.get("role") != "user":
+        if not isinstance(msg, dict) or msg.get("role") != "user":
             continue
         blocks = msg.get("content", [])
-        if not isinstance(blocks, list):
-            return []
-        urls: List[str] = []
-        for b in blocks:
-            if not isinstance(b, dict):
-                continue
-            if b.get("type") == "input_image" and b.get("image_url"):
-                urls.append(str(b.get("image_url")))
-        return urls
+        return [str(b.get("image_url")) for b in blocks if isinstance(b, dict) and b.get("type") == "input_image" and b.get("image_url")] if isinstance(blocks, list) else []
     return []
 
 
-def looks_like_answers(text: str) -> bool:
-    # matches: 1A 2C 3B or 1 a,2 c ...
-    return bool(re.search(r"\b\d+\s*[A-D]\b", text.upper()))
-
-
-def parse_answers_from_text(text: str) -> Dict[int, str]:
-    out: Dict[int, str] = {}
-    s = text.upper().replace(",", " ")
-    for m in re.finditer(r"\b(\d+)\s*([A-D])\b", s):
-        out[int(m.group(1))] = m.group(2)
-    return out
-
-
-_QCM_ANSWER_LETTER_RE = re.compile(r"[ABCD]")
-
-
-def _coerce_qcm_answer_letter(raw_answer: Any) -> str:
-    text = str(raw_answer or "").strip().upper()
-    if text in ("A", "B", "C", "D"):
-        return text
-    match = _QCM_ANSWER_LETTER_RE.search(text)
-    return match.group(0) if match else "A"
-
-
-def normalize_qcm_answers(questions: List[dict], agent_name: str) -> List[dict]:
-    """Coerce each question's LLM-provided `answer` field into a bare A/B/C/D
-    letter: the generating agents are prompted for this shape but not
-    constrained by a JSON schema, and a free-text or punctuated answer makes
-    every scoring comparison against the widget's hard-coded A/B/C/D values
-    fail silently (cf. cahier de labo 2026-09-15, diagnostic "0 partout")."""
-    for q in questions:
-        raw_answer = q.get("answer")
-        letter = _coerce_qcm_answer_letter(raw_answer)
-        if letter != str(raw_answer or "").strip().upper():
-            print(f"[{agent_name}] non-conforming answer {raw_answer!r} for question {q.get('number')!r} coerced to {letter!r}")
-        q["answer"] = letter
-    return questions
-
-
-def fit_qcm_widget_text(text: Any, max_chars: int) -> str:
-    """Keep QCM widget labels compact enough for ChatKit radio/text rendering."""
+def fit_text(text: Any, max_chars: int) -> str:
     clean = re.sub(r"\s+", " ", str(text or "")).strip()
     if len(clean) <= max_chars:
         return clean
-
     cut = clean[: max_chars - 1].rstrip()
     for sep in (". ", "; ", ", ", " - ", " "):
         idx = cut.rfind(sep)
         if idx >= max_chars // 2:
             cut = cut[:idx].rstrip()
             break
-    return f"{cut}..."
+    return f"{cut}…"
 
 
 def qcm_widget_data(title: str, questions: List[dict]) -> Dict[str, Any]:
-    """
-    Builds the dict expected by your qcm widget builder:
-    { "title": "...", "questions": [ {id,prompt,choices:[{label,value}]} ] }
-    """
     q_out: List[dict] = []
     for q in questions:
-        # q["choices"] must be list[str] length 4
         c = q["choices"]
         q_out.append({
             "id": str(q["number"]),
-            "prompt": fit_qcm_widget_text(q["text"], QCM_PROMPT_MAX_CHARS),
-            "choices": [
-                {"label": f"A) {fit_qcm_widget_text(c[0], QCM_CHOICE_MAX_CHARS)}", "value": "A"},
-                {"label": f"B) {fit_qcm_widget_text(c[1], QCM_CHOICE_MAX_CHARS)}", "value": "B"},
-                {"label": f"C) {fit_qcm_widget_text(c[2], QCM_CHOICE_MAX_CHARS)}", "value": "C"},
-                {"label": f"D) {fit_qcm_widget_text(c[3], QCM_CHOICE_MAX_CHARS)}", "value": "D"},
-            ],
+            "prompt": fit_text(q["text"], QCM_PROMPT_MAX_CHARS),
+            "choices": [{"label": f"{L}) {fit_text(c[i], QCM_CHOICE_MAX_CHARS)}", "value": L} for i, L in enumerate(LETTERS)],
         })
     return {"title": title, "questions": q_out}
 
 
-
-
 # =====================================================
-# KC GRAPH LOADER  (FIXED: leaf KCs + outline order)
+# KC GRAPH
 # =====================================================
 @dataclass
 class KCNode:
@@ -199,13 +207,9 @@ class KcGraph:
     title: str
     nodes: Dict[str, KCNode]
     source_pdf: str = ""
-
-    # raw edges
-    next_by_id: Dict[str, str] = field(default_factory=dict)          # sequence edges
-    children_by_id: Dict[str, List[str]] = field(default_factory=dict)  # contains edges
+    next_by_id: Dict[str, str] = field(default_factory=dict)
+    children_by_id: Dict[str, List[str]] = field(default_factory=dict)
     parent_by_id: Dict[str, str] = field(default_factory=dict)
-
-    # computed teaching order
     ordered_kc_ids: List[str] = field(default_factory=list)
     index_by_kc: Dict[str, int] = field(default_factory=dict)
 
@@ -216,199 +220,125 @@ class KcGraph:
         try:
             data = json.loads(raw)
         except json.JSONDecodeError:
-            # Tolerate common hand-edited JSON issue: trailing commas before ] or }.
-            cleaned = re.sub(r",(\s*[\]}])", r"\1", raw)
-            data = json.loads(cleaned)
-
-        # ---- nodes
+            data = json.loads(re.sub(r",(\s*[\]}])", r"\1", raw))
         nodes: Dict[str, KCNode] = {}
         for n in data.get("nodes", []):
             if not isinstance(n, dict):
                 continue
             nid = str(n.get("id") or "").strip()
-            if not nid:
-                continue
-            nodes[nid] = KCNode(
-                id=nid,
-                title=str(n.get("title") or "").strip(),
-                kind=str(n.get("kind") or "").strip(),
-                outline_path=n.get("outline_path") or [],
-                pages=[int(p) for p in (n.get("pages") or []) if isinstance(p, int)],
-            )
-
-        # ---- edges: sequence + contains
-        # Supports both:
-        # 1) legacy: data["edges"] = [{"type":"contains|sequence","src":"...","dst":"..."}]
-        # 2) new form: data["contains"] = [[src,dst], ...], data["sequence"] = [[src,dst], ...]
-        next_by_id: Dict[str, str] = {}
-        children_by_id: Dict[str, List[str]] = {}
-        parent_by_id: Dict[str, str] = {}
-
-        def add_contains(src: str, dst: str) -> None:
-            if not src or not dst:
-                return
-            children_by_id.setdefault(src, []).append(dst)
-            # assume single parent (outline tree)
-            if dst not in parent_by_id:
-                parent_by_id[dst] = src
-
-        def add_sequence(src: str, dst: str) -> None:
-            if not src or not dst:
-                return
-            next_by_id[src] = dst
-
-        for e in data.get("edges", []):
-            if not isinstance(e, dict):
-                continue
-            et = str(e.get("type") or "").strip().lower()
-            src = str(e.get("src") or "").strip()
-            dst = str(e.get("dst") or "").strip()
-            if et == "sequence":
-                add_sequence(src, dst)
-            elif et == "contains":
-                add_contains(src, dst)
-
-        for pair in data.get("contains", []):
-            if not isinstance(pair, list) or len(pair) < 2:
-                continue
-            add_contains(str(pair[0] or "").strip(), str(pair[1] or "").strip())
-
-        for pair in data.get("sequence", []):
-            if not isinstance(pair, list) or len(pair) < 2:
-                continue
-            add_sequence(str(pair[0] or "").strip(), str(pair[1] or "").strip())
-
+            if nid:
+                nodes[nid] = KCNode(
+                    id=nid,
+                    title=str(n.get("title") or "").strip(),
+                    kind=str(n.get("kind") or "").strip(),
+                    outline_path=n.get("outline_path") or [],
+                    pages=[int(p) for p in (n.get("pages") or []) if isinstance(p, int)],
+                )
         g = KcGraph(
-            title=str(data.get("title") or data.get("source_title") or "Course").strip(),
+            title=str(data.get("title") or data.get("source_title") or "Cours").strip(),
             nodes=nodes,
             source_pdf=str(data.get("source_pdf") or "").strip(),
-            next_by_id=next_by_id,
-            children_by_id=children_by_id,
-            parent_by_id=parent_by_id,
         )
 
-        # ---- compute ordered leaf-KCs in outline order
+        def add_contains(src: str, dst: str) -> None:
+            if src and dst:
+                g.children_by_id.setdefault(src, []).append(dst)
+                g.parent_by_id.setdefault(dst, src)
+
+        def add_sequence(src: str, dst: str) -> None:
+            if src and dst:
+                g.next_by_id[src] = dst
+
+        for e in data.get("edges", []):
+            if isinstance(e, dict):
+                et = str(e.get("type") or "").lower()
+                if et == "sequence":
+                    add_sequence(str(e.get("src") or ""), str(e.get("dst") or ""))
+                elif et == "contains":
+                    add_contains(str(e.get("src") or ""), str(e.get("dst") or ""))
+        for pair in data.get("contains", []):
+            if isinstance(pair, list) and len(pair) >= 2:
+                add_contains(str(pair[0] or "").strip(), str(pair[1] or "").strip())
+        for pair in data.get("sequence", []):
+            if isinstance(pair, list) and len(pair) >= 2:
+                add_sequence(str(pair[0] or "").strip(), str(pair[1] or "").strip())
         g.ordered_kc_ids = g._compute_ordered_teachable_kcs()
         g.index_by_kc = {kc_id: i for i, kc_id in enumerate(g.ordered_kc_ids)}
         return g
 
-    # --------------------------
-    # Teaching selection: ONLY leaf KCs (no KC/module children)
-    # --------------------------
     def _is_teachable_kc(self, nid: str) -> bool:
         n = self.nodes.get(nid)
         return bool(n and n.kind.lower() == "kc")
 
-
-    # --------------------------
-    # Order children using sequence edges when possible
-    # --------------------------
     def _ordered_children(self, parent_id: str) -> List[str]:
         kids = [k for k in self.children_by_id.get(parent_id, []) if k in self.nodes]
         if not kids:
             return []
-
         kidset = set(kids)
-
-        # collect sequence links restricted to this sibling set
         nxt = {k: self.next_by_id[k] for k in kids if self.next_by_id.get(k) in kidset}
         pointed_to = set(nxt.values())
-
-        # start nodes = those not pointed to by others
-        starters = [k for k in kids if k not in pointed_to]
-
         ordered: List[str] = []
         visited: set[str] = set()
 
-        def follow_chain(start: str):
-            cur = start
+        def follow(start: str) -> None:
+            cur: Optional[str] = start
             while cur and cur not in visited:
                 visited.add(cur)
                 ordered.append(cur)
                 cur = nxt.get(cur)
 
-        # follow chains from starters first
-        for s in starters:
-            follow_chain(s)
-
-        # append any remaining (in original order)
+        for s in [k for k in kids if k not in pointed_to]:
+            follow(s)
         for k in kids:
             if k not in visited:
-                follow_chain(k)
-
+                follow(k)
         return ordered
 
-    # --------------------------
-    # Compute an outline-ordered list of leaf KCs
-    # --------------------------
     def _compute_ordered_teachable_kcs(self) -> List[str]:
-        # pick a root: course node if exists, else any node without a parent
-        root = None
-        for nid, n in self.nodes.items():
-            if n.kind.lower() == "course":
-                root = nid
-                break
+        root = next((nid for nid, n in self.nodes.items() if n.kind.lower() == "course"), None)
         if not root:
             roots = [nid for nid in self.nodes if nid not in self.parent_by_id]
             root = roots[0] if roots else None
-
         if not root:
-            # fallback: all teachable KCs (unordered)
             return [nid for nid in self.nodes if self._is_teachable_kc(nid)]
-
         out: List[str] = []
         seen: set[str] = set()
 
-        def dfs(node_id: str):
-            # ✅ PRE-ORDER: teach the KC first
+        def dfs(node_id: str) -> None:
             if self._is_teachable_kc(node_id) and node_id not in seen:
                 seen.add(node_id)
                 out.append(node_id)
-
-            # then traverse children in outline order
             for child in self._ordered_children(node_id):
                 dfs(child)
 
         dfs(root)
         return out
 
-
-    # --------------------------
-    # Public API used by Orchestrator
-    # --------------------------
     def kc_ids(self) -> List[str]:
-        # ONLY teachable leaf KCs, already ordered
         return list(self.ordered_kc_ids)
 
     def next_kc(self, kc_id: str) -> Optional[str]:
         i = self.index_by_kc.get(kc_id)
-        if i is None:
+        if i is None or i + 1 >= len(self.ordered_kc_ids):
             return None
-        j = i + 1
-        if j < len(self.ordered_kc_ids):
-            return self.ordered_kc_ids[j]
-        return None
+        return self.ordered_kc_ids[i + 1]
 
-    def previous_kcs(self, kc_id: str, limit: int = 2, same_module_first: bool = True) -> List[str]:
+    def previous_kcs(self, kc_id: str, limit: int = 2) -> List[str]:
         i = self.index_by_kc.get(kc_id)
         if i is None or i <= 0:
             return []
         previous = self.ordered_kc_ids[:i]
-        if same_module_first:
-            cur_module = self.module_of(kc_id)
-            same_module = [pid for pid in previous if self.module_of(pid) == cur_module]
-            picked = same_module[-limit:]
-            if len(picked) < limit:
-                for pid in reversed(previous):
-                    if pid not in picked:
-                        picked.insert(0, pid)
-                    if len(picked) >= limit:
-                        break
-            return picked[-limit:]
-        return previous[-limit:]
+        cur_module = self.module_of(kc_id)
+        same = [pid for pid in previous if self.module_of(pid) == cur_module]
+        picked = same[-limit:]
+        for pid in reversed(previous):
+            if len(picked) >= limit:
+                break
+            if pid not in picked:
+                picked.insert(0, pid)
+        return picked[-limit:]
 
     def module_of(self, nid: str) -> Optional[str]:
-        """Return the module id that contains this node (KC), using parent_by_id."""
         cur = nid
         while True:
             p = self.parent_by_id.get(cur)
@@ -419,1565 +349,1094 @@ class KcGraph:
                 return p
             cur = p
 
+    def module_title(self, nid: str) -> str:
+        mid = self.module_of(nid)
+        if mid and mid in self.nodes:
+            return self.nodes[mid].title
+        return "Introduction"
 
     def module_kcs(self, module_id: str) -> List[str]:
-        """Return ordered teachable KCs under a module."""
-        if module_id not in self.nodes:
-            return []
-
         out: List[str] = []
 
-        def dfs(nid: str):
-            if self._is_teachable_kc(nid):
-                out.append(nid)
-            for ch in self._ordered_children(nid):
+        def dfs(n: str) -> None:
+            if self._is_teachable_kc(n):
+                out.append(n)
+            for ch in self._ordered_children(n):
                 dfs(ch)
 
-        dfs(module_id)
-
-        # keep in global teaching order
+        if module_id in self.nodes:
+            dfs(module_id)
         out_set = set(out)
         return [kc for kc in self.ordered_kc_ids if kc in out_set]
 
-    def module_ids(self) -> List[str]:
-        return [nid for nid, n in self.nodes.items() if n.kind.lower() == "module"]
-        # --------------------------
-    # Radar grouping: modules from outline_path (robust)
-    # --------------------------
-    def _clean_module_label(self, label: str) -> str:
-        return (label or "").strip()
+    def modules_in_order(self) -> List[Tuple[str, str, List[str]]]:
+        """(module_id or 'ROOT', title, [kc ids]) in teaching order."""
+        groups: Dict[str, List[str]] = {}
+        order: List[str] = []
+        for kc_id in self.ordered_kc_ids:
+            mid = self.module_of(kc_id) or "ROOT"
+            if mid not in groups:
+                groups[mid] = []
+                order.append(mid)
+            groups[mid].append(kc_id)
+        return [(mid, self.nodes[mid].title if mid in self.nodes else "Introduction", groups[mid]) for mid in order]
 
-    def module_label_for_kc(self, kc_id: str) -> str:
-        """
-        Decide module label for a KC using outline_path.
-        Falls back to contains-based module if outline_path is missing.
-        """
-        node = self.nodes.get(kc_id)
-        if node and isinstance(node.outline_path, list) and node.outline_path:
-            path = [str(x).strip() for x in node.outline_path if str(x).strip()]
-
-            # remove course title if it appears at the beginning
-            if path and self.title and path[0].lower() == self.title.lower():
-                path = path[1:]
-
-            # module label = first remaining level
-            if path:
-                return self._clean_module_label(path[0])
-
-        # fallback: use contains-based module node title (your old logic)
-        mid = self.module_of(kc_id)
+    def kc_pages(self, kc: KCNode) -> List[int]:
+        pages = sorted({p for p in kc.pages if p > 0})
+        if pages:
+            return pages
+        mid = self.module_of(kc.id)
         if mid and mid in self.nodes:
-            return self._clean_module_label(self.nodes[mid].title)
-
-        return "Module (Unknown)"
-
-    def module_groups_for_radar(self) -> Dict[str, List[str]]:
-        """
-        Returns: {module_label: [kc_id, kc_id, ...]} in global teaching order.
-        Uses outline_path to group.
-        """
-        groups: Dict[str, List[str]] = {}
-        for kc_id in self.ordered_kc_ids:
-            if not self._is_teachable_kc(kc_id):
-                continue
-            label = self.module_label_for_kc(kc_id)
-            groups.setdefault(label, []).append(kc_id)
-        return groups
-        # --------------------------
-    # Radar grouping by "section containers"
-    # A container is:
-    # - kind in {"module","layer"} OR
-    # - kind=="kc" BUT it has children (contains edges)
-    # --------------------------
-    def _is_container(self, nid: str) -> bool:
-        n = self.nodes.get(nid)
-        if not n:
-            return False
-        k = (n.kind or "").lower()
-        if k in {"module", "layer"}:
-            return True
-        if k == "kc" and self.children_by_id.get(nid):  # kc used as section header
-            return True
-        return False
-
-    def container_of(self, nid: str) -> Optional[str]:
-        """
-        Return nearest container ancestor for this node.
-        """
-        cur = nid
-        while True:
-            p = self.parent_by_id.get(cur)
-            if not p:
-                return None
-            if self._is_container(p):
-                return p
-            cur = p
-
-    def container_groups_for_radar(self) -> Dict[str, List[str]]:
-        """
-        Returns: {container_id: [kc_ids...]} in global teaching order.
-        Group each teachable KC by its nearest container.
-        """
-        groups: Dict[str, List[str]] = {}
-        for kc_id in self.ordered_kc_ids:
-            if not self._is_teachable_kc(kc_id):
-                continue
-            cid = self.container_of(kc_id) or "ROOT"
-            groups.setdefault(cid, []).append(kc_id)
-        return groups
-
-    def container_ids_in_order(self) -> List[str]:
-        """
-        Containers ordered by first KC appearance in the teaching order.
-        """
-        groups = self.container_groups_for_radar()
-        seen = set()
-        ordered = []
-        for kc_id in self.ordered_kc_ids:
-            if not self._is_teachable_kc(kc_id):
-                continue
-            cid = self.container_of(kc_id) or "ROOT"
-            if cid not in seen:
-                seen.add(cid)
-                ordered.append(cid)
-        # keep only those that exist in groups
-        return [cid for cid in ordered if cid in groups]
-
-
-
-def normalize_adaptive_practice_pack(
-    pack: Any,
-    min_q: int,
-    max_q: int,
-) -> Tuple[int, List[dict]]:
-    """
-    Ensures:
-    - n is clamped to [min_q, max_q]
-    - questions is list[dict]
-    - len(questions) controls n when the model intentionally returns fewer
-    - numbers are rewritten 1..n
-    """
-    if not isinstance(pack, dict):
-        return min_q, []
-
-    n = pack.get("n_questions", min_q)
-    try:
-        n = int(n)
-    except Exception:
-        n = min_q
-
-    n = max(min_q, min(n, max_q))
-
-    questions = pack.get("questions", [])
-    if not isinstance(questions, list):
-        questions = []
-
-    # truncate
-    if len(questions) > n:
-        questions = questions[:n]
-
-    # If the model returned fewer questions, accept that adaptive length.
-    if len(questions) < n:
-        n = len(questions)
-
-    # renumber
-    for i, q in enumerate(questions, start=1):
-        if isinstance(q, dict):
-            q["number"] = i
-
-    return n, questions
-
-
-def estimate_practice_bounds(
-    micro_lesson_text: str,
-    mistakes_summary: str,
-    base_min: int,
-    base_max: int,
-    review_kc_count: int = 0,
-    attempts: int = 0,
-    difficulty: str = "easy",
-) -> Tuple[int, int, int]:
-    """
-    Estimate quiz length from lesson coverage.
-    The practice should cover the lesson's essential information, not default to 3 items.
-    """
-    lines = [line.strip() for line in (micro_lesson_text or "").splitlines()]
-    essential_count = 0
-    in_essentials = False
-    for line in lines:
-        low = line.lower()
-        if low.startswith("essential information"):
-            in_essentials = True
-            continue
-        if in_essentials and line.startswith("-"):
-            essential_count += 1
-            continue
-        if in_essentials and line and not line.startswith("-"):
-            in_essentials = False
-
-    if essential_count <= 0:
-        essential_count = max(1, sum(1 for line in lines if line.startswith("-")))
-
-    mistake_count = len(re.findall(r"\bQ\d+:", mistakes_summary or ""))
-    integration_q = min(2, max(0, review_kc_count))
-    remediation_q = min(4, mistake_count)
-    difficulty_q = 2 if difficulty == "hard" else (1 if difficulty == "medium" else 0)
-    retry_q = min(2, max(0, attempts - 1))
-
-    target = essential_count + integration_q + remediation_q + difficulty_q + retry_q
-    min_q = max(base_min, min(base_max, target))
-
-    # Leave room for the model to adapt upward when the KC is dense, but avoid padding.
-    spread = 1
-    if essential_count >= 5:
-        spread += 1
-    if mistake_count >= 2:
-        spread += 1
-    if review_kc_count:
-        spread += 1
-    max_q = max(min_q, min(base_max, min_q + spread))
-    return min_q, max_q, essential_count
-
-
-def extract_lesson_essentials(micro_lesson_text: str) -> List[str]:
-    """Extract the displayed Essential information bullets from a lesson."""
-    lines = [line.strip() for line in (micro_lesson_text or "").splitlines()]
-    essentials: List[str] = []
-    in_essentials = False
-    for line in lines:
-        low = line.lower()
-        if low.startswith("essential information"):
-            in_essentials = True
-            continue
-        if in_essentials and line.startswith("-"):
-            essentials.append(line[1:].strip())
-            continue
-        if in_essentials and line and not line.startswith("-"):
-            break
-    return [item for item in essentials if item]
-
-
-def merge_essential_targets(kc_targets: List[str], lesson_targets: List[str], limit: int) -> List[str]:
-    merged: List[str] = []
-    seen: set[str] = set()
-    for target in [*kc_targets, *lesson_targets]:
-        clean = re.sub(r"\s+", " ", str(target or "")).strip()
-        key = clean.lower()
-        if not clean or key in seen:
-            continue
-        seen.add(key)
-        merged.append(clean)
-        if len(merged) >= limit:
-            break
-    return merged
-
-
-def estimate_practice_bounds_from_targets(
-    essential_targets: List[str],
-    mistakes_summary: str,
-    base_min: int,
-    base_max: int,
-    review_kc_count: int = 0,
-    attempts: int = 0,
-    difficulty: str = "easy",
-) -> Tuple[int, int]:
-    target_count = max(1, len(essential_targets))
-    mistake_count = len(re.findall(r"\bQ\d+:", mistakes_summary or ""))
-    integration_q = min(2, max(0, review_kc_count))
-    remediation_q = min(3, mistake_count)
-    retry_q = min(2, max(0, attempts - 1))
-    difficulty_q = 2 if difficulty == "hard" else (1 if difficulty == "medium" else 0)
-
-    min_q = target_count + integration_q + remediation_q + retry_q + difficulty_q
-    min_q = max(base_min, min(base_max, min_q))
-
-    spread = 1
-    if target_count >= 5:
-        spread += 1
-    if review_kc_count:
-        spread += 1
-    if mistake_count:
-        spread += 1
-
-    max_q = max(min_q, min(base_max, min_q + spread))
-    return min_q, max_q
-
-
-def missing_coverage_target_ids(essential_targets: List[str], coverage_plan: Any) -> List[str]:
-    expected_ids = {f"E{i}" for i in range(1, len(essential_targets) + 1)}
-    if not expected_ids:
+            return sorted({p for p in self.nodes[mid].pages if p > 0})
         return []
-    if not isinstance(coverage_plan, list):
-        return sorted(expected_ids)
-
-    covered: set[str] = set()
-    for item in coverage_plan:
-        if not isinstance(item, dict):
-            continue
-        target_id = str(item.get("target_id") or "")
-        question_numbers = item.get("question_numbers") or []
-        if target_id in expected_ids and isinstance(question_numbers, list) and question_numbers:
-            covered.add(target_id)
-    return sorted(expected_ids - covered)
-
-
-def _slug(text: str, max_len: int = 40) -> str:
-    cleaned = re.sub(r"[^a-z0-9]+", "_", (text or "").lower()).strip("_")
-    return (cleaned or "unknown")[:max_len].strip("_")
-
-
-def diagnostic_screening_mastery(raw_score: float) -> float:
-    """
-    Diagnostic QCM is screening evidence only.
-    A correct single diagnostic item should not imply full KC mastery.
-    """
-    bounded = max(0.0, min(1.0, raw_score))
-    span = DIAGNOSTIC_MAX_MASTERY - DIAGNOSTIC_MIN_MASTERY
-    return DIAGNOSTIC_MIN_MASTERY + (bounded * span)
-
-
-@dataclass
-class MisconceptionObservation:
-    kc_id: str
-    label: str
-    description: str
-    question_number: int
-    learner_letter: str
-    correct_letter: str
-    learner_choice: str = ""
-    correct_choice: str = ""
-
-
-class MisconceptionTracker:
-    """Creates stable misconception labels from wrong QCM choices."""
-
-    def detect(self, kc: KCNode, wrong_items: List[dict]) -> List[MisconceptionObservation]:
-        observations: List[MisconceptionObservation] = []
-        for item in wrong_items:
-            learner_choice = str(item.get("learner_choice") or "").strip()
-            correct_choice = str(item.get("correct_choice") or "").strip()
-            learner_letter = str(item.get("learner_letter") or "?").upper()
-            correct_letter = str(item.get("correct_letter") or "?").upper()
-
-            if learner_choice and correct_choice:
-                label = f"confuses_{_slug(learner_choice, 22)}_with_{_slug(correct_choice, 22)}"
-                description = (
-                    f"Selected {learner_letter} ({learner_choice}) instead of "
-                    f"{correct_letter} ({correct_choice})."
-                )
-            else:
-                label = f"incorrect_application_{_slug(kc.title, 28)}"
-                description = (
-                    f"Selected {learner_letter} instead of {correct_letter} "
-                    f"for KC '{kc.title}'."
-                )
-
-            observations.append(
-                MisconceptionObservation(
-                    kc_id=kc.id,
-                    label=label,
-                    description=description,
-                    question_number=int(item.get("number") or 0),
-                    learner_letter=learner_letter,
-                    correct_letter=correct_letter,
-                    learner_choice=learner_choice,
-                    correct_choice=correct_choice,
-                )
-            )
-        return observations
-
-
-@dataclass
-class TutorDecision:
-    action: str
-    difficulty: str = "medium"
-    reason: str = ""
-
-
-class TutorDecisionPolicy:
-    """Pedagogical policy for the ITS loop."""
-
-    def select_difficulty(self, mastery: float, attempts: int = 0) -> str:
-        if attempts <= 0 or mastery < 0.4:
-            return "easy"
-        if mastery < THRESHOLD:
-            return "medium"
-        return "hard"
-
-    def practice_result(
-        self,
-        score: float,
-        mastery: float,
-        attempts: int,
-        misconceptions: List[MisconceptionObservation],
-    ) -> TutorDecision:
-        if score >= THRESHOLD:
-            return TutorDecision(
-                action="validate_kc",
-                difficulty=self.select_difficulty(mastery, attempts),
-                reason="Practice score reached the KC mastery threshold.",
-            )
-        if misconceptions:
-            return TutorDecision(
-                action="hint_ladder_then_remediate",
-                difficulty=self.select_difficulty(mastery, attempts),
-                reason="Practice score is below threshold and misconceptions were detected.",
-            )
-        return TutorDecision(
-            action="retry_with_micro_lesson",
-            difficulty=self.select_difficulty(mastery, attempts),
-            reason="Practice score is below threshold.",
-        )
-
-    def module_result(self, score: float) -> TutorDecision:
-        if score >= MODULE_THRESHOLD:
-            return TutorDecision(
-                action="validate_module",
-                difficulty="mixed",
-                reason="Module checkpoint score reached the validation threshold.",
-            )
-        return TutorDecision(
-            action="retry_module_checkpoint",
-            difficulty="mixed",
-            reason="Module checkpoint score is below the validation threshold.",
-        )
-
-# =====================================================
-# WORKFLOW AGENTS (exactly your diagram)
-# =====================================================
-
-class DiagnosticQcmAgent:
-    """Global Diagnostic QCM (across several KCs)."""
-
-    INSTRUCTIONS = (
-        "You create a GLOBAL diagnostic multiple-choice quiz.\n"
-        "Use ONLY doctrine content from file_search.\n"
-        "Return ONLY valid JSON.\n"
-        "Each question MUST include:\n"
-        "- number (int)\n"
-        "- text (string)\n"
-        "- choices (array of 4 strings)\n"
-        "- question text under 240 characters\n"
-        "- each choice under 90 characters\n"
-        "- answer (A/B/C/D)\n"
-        "- kc_id (string)\n"
-        "Questions must be mapped to the provided kc list."
-    )
-
-    def _build_agent(self) -> Agent[AgentContext]:
-        choice = current_provider.get()
-        return Agent[AgentContext](
-            name="Diagnostic-QCM_Agent",
-            model=build_model(choice, openai_model="gpt-4.1"),
-            tools=build_tools(choice, max_results=6),
-            instructions=self.INSTRUCTIONS,
-            model_settings=build_model_settings(choice),
-        )
-
-    async def generate(self, kc_list: List[KCNode], n_questions: int, ctx: AgentContext) -> List[dict]:
-        # choose subset of KCs to cover
-        # keep prompt small: send (id,title) pairs
-        kcs_payload = [{"id": k.id, "title": k.title} for k in kc_list]
-
-        prompt = f"""
-Create {n_questions} diagnostic MCQ questions that cover multiple KCs.
-Pick KCs from this list (use their ids):
-
-{kcs_payload}
-
-Rules:
-- Use file_search to ground the questions.
-- Each question references exactly one kc_id from the list.
-- choices must be 4 short options.
-- Keep question text under 240 characters.
-- Keep each choice under 90 characters; avoid sentence-length choices.
-- answer is one of A/B/C/D.
-
-Return ONLY JSON list:
-[
-  {{"number":1,"text":"...","choices":["..","..","..",".."],"answer":"B","kc_id":"KC_xxx"}},
-  ...
-]
-"""
-        raw = await run_agent_text(self._build_agent(), prompt, ctx)
-        return normalize_qcm_answers(json.loads(raw), "Diagnostic-QCM")
-
-
-class KcEssentialTargetAgent:
-    """Extracts essential assessable targets for a KC from the PDF."""
-
-    INSTRUCTIONS = (
-        "You extract essential assessable learning targets for one KC.\n"
-        "Use only PDF/course doctrine from file_search.\n"
-        "Return only valid JSON.\n"
-        "Targets must be specific enough to generate QCM questions.\n"
-        "Do not include broad labels like 'understand the lesson'."
-    )
-
-    def _build_agent(self) -> Agent[AgentContext]:
-        choice = current_provider.get()
-        return Agent[AgentContext](
-            name="KC-essential-target_Agent",
-            model=build_model(choice, openai_model="gpt-4.1"),
-            tools=build_tools(choice, max_results=8),
-            instructions=self.INSTRUCTIONS,
-            model_settings=build_model_settings(choice),
-        )
-
-    async def extract(self, kc: KCNode, micro_lesson_text: str, ctx: AgentContext) -> List[str]:
-        prompt = f"""
-Extract the essential assessable targets for this KC from the PDF/course.
-
-KC:
-{{"id":"{kc.id}","title":"{kc.title}","pages":{kc.pages}}}
-
-Current micro-lesson shown to learner:
-{micro_lesson_text}
-
-Rules:
-- Use file_search to retrieve the KC doctrine.
-- Include every essential rule/fact needed to validate this KC.
-- Each target must be testable by at least one MCQ.
-- Keep targets concise.
-- Prefer 3-8 targets depending on KC complexity.
-- Do not create duplicate targets.
-- If the KC contains a table of correspondences, include each important row as a target.
-
-Return ONLY JSON:
-{{"essential_targets":["...", "..."]}}
-"""
-        try:
-            raw = await run_agent_text(self._build_agent(), prompt, ctx)
-            data = json.loads(raw)
-        except Exception:
-            return []
-        if not isinstance(data, dict) or not isinstance(data.get("essential_targets"), list):
-            return []
-        out: List[str] = []
-        for item in data["essential_targets"]:
-            clean = re.sub(r"\s+", " ", str(item or "")).strip()
-            if clean:
-                out.append(clean)
-        return out[:10]
-
-
-class PracticeQcmAgent:
-    """Adaptive practice QCM for one KC (LLM chooses number of questions)."""
-
-    INSTRUCTIONS = (
-        "You create an ADAPTIVE practice quiz for ONE KC.\n"
-        "You MUST use doctrine content grounded in file_search.\n"
-        "\n"
-        "Return ONLY valid JSON with EXACTLY this shape:\n"
-        "{\n"
-        '  "n_questions": 6,\n'
-        '  "coverage_plan": [{"target_id":"E1","target":"...","question_numbers":[1]}],\n'
-        '  "questions": [\n'
-        '    {"number":1,"text":"...","choices":["..","..","..",".."],"answer":"A","target_id":"E1","target":"...","integrates_kc_ids":[]},\n'
-        "    ...\n"
-        "  ]\n"
-        "}\n"
-        "\n"
-        "Rules:\n"
-        "- n_questions must follow the provided adaptive range.\n"
-        "- Choose n_questions from lesson coverage, previous-KC integration, difficulty, attempts, and mistakes.\n"
-        "- Do not default to a small fixed quiz.\n"
-        "- questions length MUST equal n_questions.\n"
-        "- choices are 4 short options.\n"
-        "- Keep question text under 240 characters for widget readability.\n"
-        "- Keep each choice under 90 characters; put context in the question, not in the choices.\n"
-        "- answer is one of A/B/C/D.\n"
-        "- Focus on weak sub-points revealed by mistakes.\n"
-    )
-
-    def _build_agent(self) -> Agent[AgentContext]:
-        choice = current_provider.get()
-        return Agent[AgentContext](
-            name="Practice-QCM_Agent",
-            model=build_model(choice, openai_model="gpt-4.1"),
-            tools=build_tools(choice, max_results=8),
-            instructions=self.INSTRUCTIONS,
-            model_settings=build_model_settings(choice),
-        )
-
-    async def generate_adaptive(
-        self,
-        kc: KCNode,
-        review_kcs: List[KCNode],
-        micro_lesson_text: str,
-        mistakes_summary: str,
-        difficulty: str,
-        min_questions: int,
-        max_questions: int,
-        essential_count: int,
-        essential_targets: List[str],
-        ctx: AgentContext,
-    ) -> Dict[str, Any]:
-        review_payload = [{"id": item.id, "title": item.title} for item in review_kcs]
-        targets_payload = [
-            {"target_id": f"E{i}", "target": target}
-            for i, target in enumerate(essential_targets, start=1)
-        ]
-        prompt = f"""
-Build an ADAPTIVE cumulative practice QCM.
-
-Primary KC to validate: "{kc.title}" ({kc.id})
-Previous/review KCs that may be combined with the primary KC:
-{review_payload}
-Target difficulty: "{difficulty}"
-Required question range: {min_questions}..{max_questions}
-Estimated essential lesson items to cover: {essential_count}
-Required essential targets from the current lesson:
-{targets_payload}
-
-Micro-lesson the learner received:
-{micro_lesson_text}
-
-Learner mistakes summary (if any):
-{mistakes_summary}
-
-Difficulty rules:
-- easy: recognition, definitions, direct identification, one concept at a time.
-- medium: normal application, including simple integration with previous KCs when available.
-- hard: transfer, comparison, multi-step reasoning, or plausible distractors combining current and previous KCs.
-- Keep every question grounded in file_search content.
-
-Cumulative practice strategy:
-- The PRIMARY learning target is always the current KC: {kc.id}.
-- Most questions must test the primary KC.
-- If previous/review KCs are provided, include 1-2 integrative questions that combine the primary KC with a previous KC.
-- Example strategy: if the learner studied "forme" before "couleur", practice for "couleur" should include questions where color and form must both be interpreted.
-- Integrative questions should still require the learner to use the primary KC, not only the previous KC.
-- Do not use previous KCs that are unrelated to the current question.
-
-Adaptive length rules:
-- Choose n_questions inside the required range: {min_questions}..{max_questions}.
-- Cover every required essential target at least once when possible.
-- If there are {len(targets_payload)} essential targets, generate at least one question per target unless max_questions prevents it.
-- Add extra questions only for detected mistakes or repeated confusion.
-- Do not pad the quiz with redundant questions.
-
-Coverage rules:
-- Every question must include target_id and target.
-- target_id must be one of the required essential target_ids, or "M1", "M2", ... for mistake-specific questions.
-- coverage_plan must list each required essential target and which question number(s) test it.
-- If an essential target cannot be tested, include it in coverage_plan with an empty question_numbers list and explain why in "coverage_note".
-- Do not validate the KC with questions that test only previous/review KCs.
-- Keep question text under 240 characters.
-- Keep each choice under 90 characters; avoid sentence-length choices.
-
-Return ONLY JSON:
-{{
-  "n_questions": <int {min_questions}..{max_questions}>,
-  "coverage_plan": [
-    {{"target_id":"E1","target":"...","question_numbers":[1],"coverage_note":""}}
-  ],
-  "questions": [
-    {{"number":1,"text":"...","choices":["..","..","..",".."],"answer":"B","target_id":"E1","target":"essential item, mistake, or integration tested","integrates_kc_ids":["..."]}},
-    ...
-  ]
-}}
-"""
-        raw = await run_agent_text(self._build_agent(), prompt, ctx)
-        parsed = json.loads(raw)
-        normalize_qcm_answers(parsed.get("questions", []), "Practice-QCM")
-        return parsed
-
-    async def repair_coverage(
-        self,
-        kc: KCNode,
-        review_kcs: List[KCNode],
-        existing_pack: Dict[str, Any],
-        essential_targets: List[str],
-        missing_target_ids: List[str],
-        difficulty: str,
-        min_questions: int,
-        max_questions: int,
-        ctx: AgentContext,
-    ) -> Dict[str, Any]:
-        targets_payload = [
-            {"target_id": f"E{i}", "target": target}
-            for i, target in enumerate(essential_targets, start=1)
-        ]
-        review_payload = [{"id": item.id, "title": item.title} for item in review_kcs]
-        prompt = f"""
-Repair this practice QCM before it is shown to the learner.
-
-Primary KC: "{kc.title}" ({kc.id})
-Previous/review KCs:
-{review_payload}
-Difficulty: {difficulty}
-Required range: {min_questions}..{max_questions}
-Required essential targets:
-{targets_payload}
-Missing target ids:
-{missing_target_ids}
-
-Existing QCM:
-{existing_pack}
-
-Repair rules:
-- Return a complete replacement JSON pack.
-- Keep valid existing questions when useful.
-- Add or rewrite questions so every E target has at least one question.
-- Each question must primarily validate the current KC.
-- Integrative questions may use review KCs but must still require the current KC.
-- Number of questions must be inside {min_questions}..{max_questions}.
-- Use file_search for PDF grounding.
-- No duplicate questions.
-- Keep question text under 240 characters.
-- Keep each choice under 90 characters; avoid sentence-length choices.
-
-Return ONLY JSON with the same shape:
-{{
-  "n_questions": <int>,
-  "coverage_plan": [
-    {{"target_id":"E1","target":"...","question_numbers":[1],"coverage_note":""}}
-  ],
-  "questions": [
-    {{"number":1,"text":"...","choices":["..","..","..",".."],"answer":"B","target_id":"E1","target":"...","integrates_kc_ids":[]}}
-  ]
-}}
-"""
-        raw = await run_agent_text(self._build_agent(), prompt, ctx)
-        parsed = json.loads(raw)
-        normalize_qcm_answers(parsed.get("questions", []), "Practice-QCM-repair")
-        return parsed
-
-
-class ModuleQcmAgent:
-    """Global module checkpoint quiz (covers all KCs in one module)."""
-
-    INSTRUCTIONS = (
-        "You create a MODULE checkpoint multiple-choice quiz.\n"
-        "Use ONLY doctrine content from file_search.\n"
-        "Return ONLY valid JSON.\n"
-        "Each question MUST include:\n"
-        "- number (int)\n"
-        "- text (string)\n"
-        "- choices (array of 4 strings)\n"
-        "- question text under 240 characters\n"
-        "- each choice under 90 characters\n"
-        "- answer (A/B/C/D)\n"
-        "- kc_id (string)\n"
-        "Questions must be mapped to the provided kc list."
-    )
-
-    def _build_agent(self) -> Agent[AgentContext]:
-        choice = current_provider.get()
-        return Agent[AgentContext](
-            name="Module-QCM_Agent",
-            model=build_model(choice, openai_model="gpt-5.1"),
-            tools=build_tools(choice, max_results=8),
-            instructions=self.INSTRUCTIONS,
-            model_settings=build_model_settings(choice),
-        )
-
-    async def generate(self, module_title: str, kc_list: List[KCNode], n_questions: int, ctx: AgentContext) -> List[dict]:
-        kcs_payload = [{"id": k.id, "title": k.title} for k in kc_list]
-        prompt = f"""
-Create {n_questions} MCQ questions as a module checkpoint quiz for module: "{module_title}".
-
-KCs to cover (use their ids):
-{kcs_payload}
-
-Rules:
-- Use file_search to ground the questions.
-- Each question references exactly one kc_id from the list.
-- choices must be 4 short options.
-- Keep question text under 240 characters.
-- Keep each choice under 90 characters; avoid sentence-length choices.
-- answer is one of A/B/C/D.
-
-Return ONLY JSON list:
-[
-  {{"number":1,"text":"...","choices":["..","..","..",".."],"answer":"B","kc_id":"KC_xxx"}},
-  ...
-]
-"""
-        raw = await run_agent_text(self._build_agent(), prompt, ctx)
-        return normalize_qcm_answers(json.loads(raw), "Module-QCM")
-
-
-
-class MicroLessonAgent:
-    """Adaptive KC micro-lesson rendered from a required lesson form."""
-
-    INSTRUCTIONS = (
-        "You create an adaptive micro-lesson ONLY about the provided KC.\n"
-        "Ground every field in doctrine using file_search.\n"
-        "Return ONLY valid JSON, no markdown code fences.\n"
-        "The lesson must be short but must not omit essential doctrine for the KC.\n"
-        "Return this exact shape:\n"
-        "{\n"
-        '  "lesson_plan": {\n'
-        '    "lesson_complexity": "simple|medium|complex",\n'
-        '    "lesson_mode": "first_exposure|remediation|focused_review|brief_validation",\n'
-        '    "max_words": 240,\n'
-        '    "essential_information_count": 4,\n'
-        '    "reason": "..."\n'
-        "  },\n"
-        '  "lesson": {\n'
-        '    "title": "...",\n'
-        '    "source_basis": ["short copied or tightly paraphrased doctrine point from the PDF", "..."],\n'
-        '    "learning_objective": "...",\n'
-        '    "essential_information": ["...", "..."],\n'
-        '    "rule_to_remember": "...",\n'
-        '    "operational_example": "...",\n'
-        '    "common_mistake": "...",\n'
-        '    "targeted_remediation": "...",\n'
-        '    "self_check": "..."\n'
-        "  }\n"
-        "}\n"
-        "Rules:\n"
-        "- First retrieve the PDF content for the KC with file_search.\n"
-        "- lesson_plan must choose a budget from the KC complexity and learner state.\n"
-        "- max_words must be as short as possible but complete enough for the KC.\n"
-        "- source_basis must contain the key PDF facts/terms used to build the lesson.\n"
-        "- Preserve official doctrine terms, labels, colors, symbols, and operational names exactly when they appear in the PDF.\n"
-        "- Reformulate only explanations, not official terms.\n"
-        "- Do not add external knowledge or invented rules.\n"
-        "- If the PDF evidence is insufficient, say that in source_basis and keep the lesson conservative.\n"
-    )
-
-    def _build_agent(self) -> Agent[AgentContext]:
-        choice = current_provider.get()
-        return Agent[AgentContext](
-            name="Micro-lesson_Agent",
-            model=build_model(choice, openai_model="gpt-4.1"),
-            tools=build_tools(choice, max_results=8),
-            instructions=self.INSTRUCTIONS,
-            model_settings=build_model_settings(choice),
-        )
-
-    def _validate_lesson_plan(
-        self,
-        plan: Any,
-        fallback_mode: str,
-        fallback_essential_count: str,
-    ) -> Dict[str, Any]:
-        if not isinstance(plan, dict):
-            plan = {}
-
-        complexity = str(plan.get("lesson_complexity") or "medium").lower().strip()
-        if complexity not in {"simple", "medium", "complex"}:
-            complexity = "medium"
-
-        mode = str(plan.get("lesson_mode") or fallback_mode).lower().strip()
-        if mode not in {"first_exposure", "remediation", "focused_review", "brief_validation"}:
-            mode = fallback_mode
-
-        try:
-            requested_words = int(plan.get("max_words") or 0)
-        except Exception:
-            requested_words = 0
-
-        budget_by_mode_complexity = {
-            "brief_validation": {"simple": 90, "medium": 110, "complex": 130},
-            "focused_review": {"simple": 140, "medium": 180, "complex": 220},
-            "remediation": {"simple": 160, "medium": 220, "complex": 280},
-            "first_exposure": {"simple": 180, "medium": 260, "complex": 360},
-        }
-        max_allowed = budget_by_mode_complexity[mode][complexity]
-        min_allowed = 80 if mode != "brief_validation" else 50
-        if requested_words <= 0:
-            requested_words = max_allowed
-        max_words = max(min_allowed, min(requested_words, max_allowed))
-
-        try:
-            essential_count = int(plan.get("essential_information_count") or 0)
-        except Exception:
-            essential_count = 0
-        if essential_count <= 0:
-            m = re.search(r"\d+", fallback_essential_count)
-            essential_count = int(m.group(0)) if m else 3
-        essential_count = max(1, min(essential_count, 7))
-
-        return {
-            "lesson_complexity": complexity,
-            "lesson_mode": mode,
-            "max_words": max_words,
-            "essential_information_count": essential_count,
-            "reason": str(plan.get("reason") or "").strip(),
-            "max_allowed_words": max_allowed,
-        }
-
-    def _format_lesson_form(self, data: Dict[str, Any], fallback_title: str) -> str:
-        title = str(data.get("title") or fallback_title).strip()
-        source_basis = data.get("source_basis") or []
-        if not isinstance(source_basis, list):
-            source_basis = [str(source_basis)]
-        source_basis = [str(x).strip() for x in source_basis if str(x).strip()]
-        objective = str(data.get("learning_objective") or "").strip()
-        essentials = data.get("essential_information") or []
-        if not isinstance(essentials, list):
-            essentials = [str(essentials)]
-        essentials = [str(x).strip() for x in essentials if str(x).strip()]
-        rule = str(data.get("rule_to_remember") or "").strip()
-        example = str(data.get("operational_example") or "").strip()
-        mistake = str(data.get("common_mistake") or "").strip()
-        remediation = str(data.get("targeted_remediation") or "").strip()
-        self_check = str(data.get("self_check") or "").strip()
-
-        lines = [title]
-        if source_basis:
-            lines.append("PDF basis:")
-            lines.extend(f"- {item}" for item in source_basis[:4])
-        if objective:
-            lines.append(f"Objective: {objective}")
-        if essentials:
-            lines.append("Essential information:")
-            lines.extend(f"- {item}" for item in essentials[:5])
-        if rule:
-            lines.append(f"Rule to remember: {rule}")
-        if example:
-            lines.append(f"Example: {example}")
-        if mistake:
-            lines.append(f"Common mistake: {mistake}")
-        if remediation:
-            lines.append(f"Targeted remediation: {remediation}")
-        if self_check:
-            lines.append(f"Self-check: {self_check}")
-        return "\n".join(lines)
-
-    async def build(
-        self,
-        kc: KCNode,
-        ctx: AgentContext,
-        mastery: float = 0.0,
-        attempts: int = 0,
-        mistakes_summary: str = "",
-        misconception_labels: Optional[List[str]] = None,
-    ) -> Tuple[str, Dict[str, Any]]:
-        misconception_labels = misconception_labels or []
-        if attempts <= 0:
-            lesson_mode = "first_exposure"
-            essential_count = "3-5"
-            focus = "Give the minimum foundation needed before first practice."
-        elif mastery < 0.4 or misconception_labels:
-            lesson_mode = "remediation"
-            essential_count = "2-4"
-            focus = "Target the specific mistake pattern. Do not reteach the whole KC."
-        elif mastery < THRESHOLD:
-            lesson_mode = "focused_review"
-            essential_count = "2-3"
-            focus = "Review only the weak point needed for the next practice."
-        else:
-            lesson_mode = "brief_validation"
-            essential_count = "1-2"
-            focus = "Give a very short confirmation and one transfer tip."
-
-        prompt = f"""
-Teach the learner a micro-lesson on this KC only.
-
-KC title: "{kc.title}"
-KC id: "{kc.id}"
-Learner level estimate for this KC: {mastery:.2f}
-This estimate may come from diagnostic screening and must not be treated as KC validation.
-Practice attempts on this KC: {attempts}
-Lesson mode: {lesson_mode}
-Detected misconception labels:
-{misconception_labels}
-
-Recent mistake summary:
-{mistakes_summary or "(No mistakes yet.)"}
-
-Constraints:
-- {focus}
-- Fill every field in the lesson form.
-- The lesson must be built from PDF content retrieved with file_search, not from general memory.
-- lesson_plan.lesson_mode should usually be "{lesson_mode}" unless the PDF evidence clearly justifies another mode.
-- lesson_plan.essential_information_count should match the number of essential PDF points needed for this KC.
-- source_basis must list the PDF facts/terms that justify the lesson.
-- essential_information must contain {essential_count} concise items.
-- Keep each field concise, but include all essential doctrine needed for this KC.
-- If the KC has several essential rules, include them as separate essential_information items.
-- Keep official PDF terms exactly; reformulate around them only to improve learner understanding.
-- Do not invent examples that contradict or go beyond the PDF doctrine.
-- If misconceptions are provided, explain exactly that confusion.
-- If no misconceptions are provided, teach only the core rule for first practice.
-- Use file_search to ground definitions/rules.
-- Return ONLY valid JSON with the required schema.
-"""
-        raw = await run_agent_text(self._build_agent(), prompt, ctx)
-        try:
-            data = json.loads(raw)
-        except json.JSONDecodeError:
-            return raw, {
-                "lesson_complexity": "unknown",
-                "lesson_mode": lesson_mode,
-                "max_words": 220,
-                "essential_information_count": 0,
-                "reason": "Model returned non-JSON lesson text.",
-                "max_allowed_words": 220,
-            }
-        if not isinstance(data, dict):
-            return raw, {
-                "lesson_complexity": "unknown",
-                "lesson_mode": lesson_mode,
-                "max_words": 220,
-                "essential_information_count": 0,
-                "reason": "Model returned JSON that was not an object.",
-                "max_allowed_words": 220,
-            }
-        plan = self._validate_lesson_plan(
-            data.get("lesson_plan"),
-            fallback_mode=lesson_mode,
-            fallback_essential_count=essential_count,
-        )
-        lesson_data = data.get("lesson") if isinstance(data.get("lesson"), dict) else data
-        return self._format_lesson_form(lesson_data, kc.title), plan
-
-
-
-
-class ExplainMistakeAgent:
-    """Explain mistakes when score below threshold."""
-
-    INSTRUCTIONS = (
-        "Tu expliques les erreurs de l'apprenant brievement et clairement.\n"
-        "Reponds toujours en francais.\n"
-        "Use doctrine from file_search.\n"
-        "Output plain text (no JSON).\n"
-        "Do not expose internal misconception labels.\n"
-        "Do not list every error if there are many; group similar errors.\n"
-        "Include: score interpretation, 2-4 key corrections, one mini-remediation, and next action."
-    )
-
-    def _build_agent(self) -> Agent[AgentContext]:
-        choice = current_provider.get()
-        return Agent[AgentContext](
-            name="Explain-mistake_Agent",
-            model=build_model(choice, openai_model="gpt-4.1"),
-            tools=build_tools(choice, max_results=8),
-            instructions=self.INSTRUCTIONS,
-            model_settings=build_model_settings(choice),
-        )
-
-    async def explain(self, kc: KCNode, wrong_items: List[dict], ctx: AgentContext) -> str:
-        limited_wrong_items = wrong_items[:5]
-        prompt = f"""
-L'apprenant n'a pas encore valide cette KC: "{kc.title}" ({kc.id})
-
-Erreurs observees, limitees aux plus importantes:
-{limited_wrong_items}
-
-Explique les erreurs avec la doctrine du PDF.
-Contraintes:
-- Reponds en francais.
-- Maximum 140 mots.
-- Ne montre jamais les labels internes comme "confuses_...".
-- Regroupe les erreurs similaires.
-- Donne une mini-remediation concrete.
-- Termine par: Tape "hint" pour un indice ou "practice" pour refaire un QCM cible.
-"""
-        res = await Runner.run(self._build_agent(), prompt, context=ctx)
-        return (res.final_output or "").strip()
-
-
-class LearnerQuestionAgent:
-    """Answers learner questions only inside the current learning frontier."""
-
-    INSTRUCTIONS = (
-        "You answer learner clarification questions during a micro-lesson.\n"
-        "Use file_search for PDF grounding.\n"
-        "You may answer ONLY if the question concerns the current KC or previous KCs provided by the orchestrator.\n"
-        "If the learner asks about a future KC, do not teach it. Say it will be covered later and redirect to the current KC.\n"
-        "If the question is outside the course/PDF, say it is outside the current lesson scope.\n"
-        "Keep answers concise, pedagogical, and grounded in the provided allowed KC list.\n"
-        "Return plain text only."
-    )
-
-    def _build_agent(self) -> Agent[AgentContext]:
-        choice = current_provider.get()
-        return Agent[AgentContext](
-            name="Learner-question_Agent",
-            model=build_model(choice, openai_model="gpt-4.1"),
-            tools=build_tools(choice, max_results=8),
-            instructions=self.INSTRUCTIONS,
-            model_settings=build_model_settings(choice),
-        )
-
-    async def answer(
-        self,
-        question: str,
-        current_kc: KCNode,
-        allowed_kcs: List[KCNode],
-        future_kcs: List[KCNode],
-        current_micro_lesson: str,
-        ctx: AgentContext,
-    ) -> str:
-        allowed_payload = [
-            {"id": kc.id, "title": kc.title, "pages": kc.pages}
-            for kc in allowed_kcs
-        ]
-        future_payload = [
-            {"id": kc.id, "title": kc.title}
-            for kc in future_kcs[:12]
-        ]
-        prompt = f"""
-Learner question:
-{question}
-
-Current KC:
-{{"id":"{current_kc.id}","title":"{current_kc.title}","pages":{current_kc.pages}}}
-
-Allowed KCs for answering (current + previous only):
-{allowed_payload}
-
-Future KCs that must NOT be taught yet:
-{future_payload}
-
-Current micro-lesson text:
-{current_micro_lesson or "(No current micro-lesson text stored.)"}
-
-Decision rules:
-- If the question is answerable using the current KC or allowed previous KCs, answer it with PDF-grounded explanation.
-- If it requires a future KC, briefly say it is not part of the current learning step yet, name the current KC, and offer a small bridge without teaching the future KC.
-- If it is outside the PDF/course, say it is outside the current lesson scope.
-- Do not reveal full future-KC content, definitions, examples, or rules.
-- Mention source pages when available.
-"""
-        res = await Runner.run(self._build_agent(), prompt, context=ctx)
-        return (res.final_output or "").strip()
-
-
-class VisualQuestionAgent:
-    """Answers learner questions about uploaded symbol images using the whole PDF course."""
-
-    INSTRUCTIONS = (
-        "Tu es un tuteur visuel pour les symboles cartographiques.\n"
-        "Reponds toujours en francais, sauf si l'apprenant demande une autre langue.\n"
-        "Analyse tous les elements visibles de l'image en details "
-    )
-
-    def _build_agent(self) -> Agent[AgentContext]:
-        choice = current_provider.get()
-        return Agent[AgentContext](
-            name="Visual-symbol-question_Agent",
-            model=build_model(choice, openai_model="gpt-5.5", vision=True),
-            tools=build_tools(choice, max_results=8),
-            instructions=self.INSTRUCTIONS,
-            model_settings=build_model_settings(choice),
-        )
-
-    async def answer(
-        self,
-        question: str,
-        image_urls: List[str],
-        current_kc: Optional[KCNode],
-        course_kcs: List[KCNode],
-        current_micro_lesson: str,
-        visual_context: List[dict],
-        ctx: AgentContext,
-    ) -> str:
-        course_payload = [
-            {"id": kc.id, "title": kc.title, "pages": kc.pages}
-            for kc in course_kcs
-        ]
-        current_payload = (
-            {"id": current_kc.id, "title": current_kc.title, "pages": current_kc.pages}
-            if current_kc
-            else None
-        )
-        prompt = f"""
-L'apprenant a ajoute une ou plusieurs images de symbole et demande :
-{question or "Que signifie ce symbole ?"}
-
-KC actuelle, si l'apprenant est dans une lecon :
-{current_payload or "(Aucune KC actuelle. Repondre avec tout le PDF du cours.)"}
-
-KCs/pages disponibles dans le cours :
-{course_payload}
-
-Micro-lecon actuelle :
-{current_micro_lesson or "(Aucune micro-lecon memorisee.)"}
-
-Historique recent sur la meme image :
-{visual_context[-6:] if visual_context else "(Aucun historique visuel.)"}
-
-Regles :
-- Decris d'abord ce que tu vois : forme, couleur, contour, texte ou pictogramme.
-- Si la question est une relance courte ("et la couleur ?", "pourquoi ?", "et la forme ?"), utilise l'historique recent et la meme image.
-- Relie chaque element visible a la signification exacte dans le PDF.
-- Ne dis pas "consultez le tableau" si la reponse est dans le PDF.
-- Exemple de precision attendue : "triangle = avertissement / danger / actions SP".
-- Si plusieurs elements sont utiles, donne une interpretation combinee.
-- Cite les pages sources quand elles sont disponibles.
-
-Format de reponse :
-1. "Je vois..."
-2. "Signification..."
-3. "Interpretation..."
-4. "Source..."
-"""
-        content: List[dict] = [{"type": "input_text", "text": prompt}]
-        for image_url in image_urls:
-            content.append({"type": "input_image", "image_url": image_url, "detail": "auto"})
-        res = await Runner.run(
-            self._build_agent(),
-            [{"role": "user", "content": content}],
-            context=ctx,
-        )
-        return (res.final_output or "").strip()
-
-
-class ScoreFindWeaknessAgent:
-    """Score + Find weakness (pure python)."""
-
-    def find_weakness(
-        self,
-        question_to_kc: Dict[int, str],
-        user_answers: Dict[int, str],
-        correct_answers: Dict[int, str],
-    ) -> Tuple[Optional[str], float, Dict[str, Tuple[int, int]]]:
-        """
-        Returns:
-        - weakness_kc_id
-        - overall_score (0..1)
-        - per_kc_stats: kc_id -> (correct_count, total_count)
-        """
-        total = len(correct_answers) or 1
-        correct_total = 0
-
-        per: Dict[str, Tuple[int, int]] = {}
-
-        for qnum, correct in correct_answers.items():
-            kc_id = question_to_kc.get(qnum)
-            if not kc_id:
-                continue
-            u = user_answers.get(qnum, "").upper()
-            is_ok = (u == correct.upper())
-            correct_total += 1 if is_ok else 0
-
-            c_cnt, t_cnt = per.get(kc_id, (0, 0))
-            per[kc_id] = (c_cnt + (1 if is_ok else 0), t_cnt + 1)
-
-        overall = correct_total / total
-
-        weakness = None
-        weakness_score = 2.0
-        for kc_id, (c_cnt, t_cnt) in per.items():
-            s = (c_cnt / t_cnt) if t_cnt else 1.0
-            if s < weakness_score:
-                weakness_score = s
-                weakness = kc_id
-
-        return weakness, overall, per
 
 
 # =====================================================
-# EVALUATOR (kept for compatibility with your server)
-# =====================================================
-class EvaluatorAgent:
-    def evaluate(self, user: Dict[int, str], correct: Dict[int, str]):
-        score = 0
-        details: List[str] = []
-        for num, ans in correct.items():
-            user_ans = user.get(num, "").upper()
-            if user_ans == ans:
-                score += 1
-                details.append(f"Q{num}: ✓ Correct ({user_ans})")
-            else:
-                details.append(f"Q{num}: ✗ Wrong (Your: {user_ans}, Correct: {ans})")
-        score20 = round((score / max(1, len(correct))) * 20, 2)
-        return score, score20, details
-
-
-# =====================================================
-# SESSION STATE (per thread)
+# SESSION (per learner, persisted)
 # =====================================================
 @dataclass
 class Session:
-    phase: str = "idle"
-    scope: str = "diagnostic"
+    user_id: str = ""
+    phase: str = "idle"                 # idle | waiting_answers
+    scope: str = "diagnostic"           # diagnostic | practice | module_quiz
     current_kc_id: Optional[str] = None
-
-    last_hidden_answers: Dict[int, str] = field(default_factory=dict)
-    last_question_to_kc: Dict[int, str] = field(default_factory=dict)
-    last_question_text: Dict[int, dict] = field(default_factory=dict)
-
+    quiz_id: str = ""
+    quiz_questions: Dict[str, dict] = field(default_factory=dict)   # number(str) -> question dict
     mastery: Dict[str, float] = field(default_factory=dict)
     last_score_by_kc: Dict[str, float] = field(default_factory=dict)
     diagnostic_profile: Dict[str, float] = field(default_factory=dict)
     diagnostic_raw_score_by_kc: Dict[str, float] = field(default_factory=dict)
+    diagnostic_done: bool = False
+    weak_queue: List[str] = field(default_factory=list)
+    validated_kc_ids: List[str] = field(default_factory=list)
     kc_essential_targets: Dict[str, List[str]] = field(default_factory=dict)
-
-    # ✅ Option B memory
-    current_micro_lesson: str = ""          # last generated micro-lesson for current KC
-    last_mistakes_summary: str = ""         # compact summary used to adapt practice
+    current_micro_lesson: str = ""
+    last_mistakes_summary: str = ""
     misconceptions: Dict[str, List[str]] = field(default_factory=dict)
-    misconception_evidence: Dict[str, List[dict]] = field(default_factory=dict)
     attempts_by_kc: Dict[str, int] = field(default_factory=dict)
     pending_hint_ladder: List[str] = field(default_factory=list)
     hint_index: int = 0
-    evidence_events: List[dict] = field(default_factory=list)
     last_tutor_action: str = ""
-    
-    # ✅ NEW: gate for "next"
     can_advance: bool = False
     validated_kc_id: Optional[str] = None
     pending_next_kc_id: Optional[str] = None
-
-    current_module_id: Optional[str] = None
-
-    pending_module_id: Optional[str] = None     # module that must be validated by checkpoint
-    module_gate_locked: bool = False            # True => must pass module quiz before next
-
-
+    pending_module_id: Optional[str] = None
+    module_gate_locked: bool = False
     module_mastery: Dict[str, float] = field(default_factory=dict)
     pending_module_retry: bool = False
-    last_module_feedback: str = ""
     last_visual_image_urls: List[str] = field(default_factory=list)
     visual_question_history: List[dict] = field(default_factory=list)
+    seen_question_ids: List[str] = field(default_factory=list)
+    recent_stems: Dict[str, List[str]] = field(default_factory=dict)   # kc_id -> stems already asked
+    llm_budget_date: str = ""
+    llm_budget_used: int = 0
+    pending_reset: bool = False
+    created_at: str = ""
+    updated_at: str = ""
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "Session":
+        known = {f.name for f in fields(cls)}
+        return cls(**{k: v for k, v in (data or {}).items() if k in known})
+
+
+class BudgetExceeded(Exception):
+    pass
+
 
 # =====================================================
-# ORCHESTRATOR (workflow)
+# ORCHESTRATOR
 # =====================================================
 class Orchestrator:
-    """
-    Implements:
-    A[System runs Global Diagnostic QCM] --> B[Diagnostic-QCM_Agent]
-    B --> C[Score + Find-Weakness_Agent]
-    C --> D[Micro-lesson_Agent]
-    D --> E[Practice-QCM_Agent]
-    E --> F{Score < threshold?}
-    F -- YES --> G[Explain-mistake_Agent]
-    G --> D
-    F -- NO --> H[Validated -> Next KC/Module or Stop]
-    """
-
-    def __init__(self):
-        # load KC graph once
+    def __init__(self) -> None:
         self.graph = KcGraph.load(KC_GRAPH_PATH)
-
-        # workflow agents
-        self.diagnostic_qcm = DiagnosticQcmAgent()
-        self.kc_targets = KcEssentialTargetAgent()
-        self.scorer = ScoreFindWeaknessAgent()
-        self.micro_lesson = MicroLessonAgent()
-        self.practice_qcm = PracticeQcmAgent()
-        self.explain_mistake = ExplainMistakeAgent()
-        self.learner_question = LearnerQuestionAgent()
-        self.visual_question = VisualQuestionAgent()
-        self.module_qcm = ModuleQcmAgent()
-        self.policy = TutorDecisionPolicy()
-        self.misconception_tracker = MisconceptionTracker()
-        # compatibility with your server
-        self.evaluator = EvaluatorAgent()
-        self.hidden_answers: Dict[int, str] | None = None  # <-- server reads this in qcm.submit
-
-        # sessions per thread
+        self.doc = doctrine()
+        self.store = store()
+        self.bank = QuestionBank(self.store)
         self._sessions: Dict[str, Session] = {}
+        print(f"[orchestrator] {len(self.graph.kc_ids())} notions, doctrine source={self.doc.source}, bank={sum(self.bank.stats().values())} questions")
 
-    # --------------------------
-    # Compatibility method used in your server
-    # --------------------------
-    def format_evaluation(self, score, score20, details):
-        return f"""📊 Evaluation
+    # ---------------- session persistence ----------------
+    @staticmethod
+    def _user_id(ctx: Any) -> str:
+        rc = getattr(ctx, "request_context", None) or {}
+        return str(rc.get(USER_ID_KEY) or getattr(getattr(ctx, "thread", None), "id", None) or "anonymous")
 
-Score: {score}/{len(details)}
-Score /20: {score20}
+    async def _load_session(self, user_id: str) -> Session:
+        if user_id in self._sessions:
+            return self._sessions[user_id]
+        data = await self.store.aget_json(f"sessions/{user_id}.json", None)
+        sess = Session.from_dict(data) if isinstance(data, dict) else Session(user_id=user_id, created_at=datetime.now(timezone.utc).isoformat())
+        sess.user_id = user_id
+        self._sessions[user_id] = sess
+        return sess
 
-Details:
-{chr(10).join(details)}
-"""
+    def load_session_sync(self, user_id: str) -> Session:
+        if user_id in self._sessions:
+            return self._sessions[user_id]
+        data = self.store.get_json(f"sessions/{user_id}.json", None)
+        sess = Session.from_dict(data) if isinstance(data, dict) else Session(user_id=user_id)
+        sess.user_id = user_id
+        self._sessions[user_id] = sess
+        return sess
 
-    # --------------------------
-    def _get_sess(self, ctx: AgentContext) -> Session:
-        tid = getattr(ctx.thread, "id", "default-thread")
-        if tid not in self._sessions:
-            self._sessions[tid] = Session()
-        return self._sessions[tid]
+    async def _save_session(self, sess: Session) -> None:
+        sess.updated_at = datetime.now(timezone.utc).isoformat()
+        await self.store.aput_json(f"sessions/{sess.user_id}.json", asdict(sess))
 
-    def _kc_nodes_for_diagnostic(self) -> List[KCNode]:
-        # pick up to 8 KCs from the graph (can be improved later)
-        ids = self.graph.kc_ids()
-        picked = ids[: min(len(ids), 8)]
-        return [self.graph.nodes[i] for i in picked if i in self.graph.nodes]
-
-    def _kc_ref_pages(self, kc: KCNode) -> List[int]:
-        pages = [p for p in kc.pages if isinstance(p, int) and p > 0]
-        return sorted(set(pages))
-
-    def _build_lesson_with_refs(self, kc: KCNode, lesson_text: str) -> Dict[str, Any]:
-        pages = self._kc_ref_pages(kc)
-        if not pages:
-            return {"type": "lesson_with_ref", "text": lesson_text}
-
-        refs_txt = ", ".join(f"p.{p}" for p in pages)
-        full_text = f"{lesson_text}\n\nReferences: {refs_txt}"
-
-        first_page = pages[0]
-        pdf_name = self.graph.source_pdf or "Charte graphique 2025 - Impression.pdf"
-        pdf_url = f"{PUBLIC_BASE_URL}/static/{quote(pdf_name)}#page={first_page}"
-        html = ""
-
-        return {
-            "type": "lesson_with_ref",
-            "text": full_text,
-            "ref_widget": {
-                "title": f"Source - {kc.title}",
-                "subtitle": f"Reference: p.{first_page}",
-                "buttonLabel": f"Open source p.{first_page}",
-                "icon": "analytics",
-                "url": pdf_url,
-                "html": html,
-            },
-        }
-
-    def _thread_id(self, ctx: AgentContext) -> str:
-        return str(getattr(ctx.thread, "id", "default-thread"))
-
-    def _record_event(self, sess: Session, ctx: AgentContext, event: Dict[str, Any]) -> None:
+    def _record_event(self, sess: Session, ctx: Any, event: Dict[str, Any]) -> None:
         enriched = {
             "timestamp": datetime.now(timezone.utc).isoformat(),
-            "thread_id": self._thread_id(ctx),
+            "thread_id": str(getattr(getattr(ctx, "thread", None), "id", "") or ""),
+            "user_id": sess.user_id,
+            "provider": current_provider.get().provider,
             **event,
         }
-        sess.evidence_events.append(enriched)
         try:
             os.makedirs(os.path.dirname(EVIDENCE_LOG_PATH), exist_ok=True)
             with open(EVIDENCE_LOG_PATH, "a", encoding="utf-8") as f:
                 f.write(json.dumps(enriched, ensure_ascii=False, default=str) + "\n")
         except Exception as exc:
             print(f"Evidence logging failed: {exc}")
+        try:
+            asyncio.get_running_loop().create_task(self.store.aappend_event(enriched))
+        except RuntimeError:
+            self.store.append_event(enriched)
 
-    def _choice_text(self, qinfo: dict, letter: str) -> str:
-        choices = qinfo.get("choices", [])
-        idx = ord(str(letter or "").upper()[:1] or "A") - ord("A")
-        if isinstance(choices, list) and 0 <= idx < len(choices):
-            return str(choices[idx])
-        return ""
+    def _charge_budget(self, sess: Session, n: int = 1) -> None:
+        today = date.today().isoformat()
+        if sess.llm_budget_date != today:
+            sess.llm_budget_date = today
+            sess.llm_budget_used = 0
+        if sess.llm_budget_used + n > MAX_GENERATIONS_PER_DAY:
+            raise BudgetExceeded()
+        sess.llm_budget_used += n
 
-    def _build_wrong_items(self, sess: Session, answers: Dict[int, str], correct: Dict[int, str]) -> List[dict]:
-        wrong_items: List[dict] = []
-        for qnum, corr in correct.items():
-            learner = answers.get(qnum, "")
-            if learner.upper() == corr.upper():
-                continue
-            qinfo = sess.last_question_text.get(qnum, {})
-            wrong_items.append({
-                "number": qnum,
-                "question": qinfo.get("text", ""),
-                "choices": qinfo.get("choices", []),
-                "correct_letter": corr,
-                "learner_letter": learner,
-                "correct_choice": self._choice_text(qinfo, corr),
-                "learner_choice": self._choice_text(qinfo, learner),
-            })
-        return wrong_items
+    # ---------------- helpers ----------------
+    def _kc(self, kc_id: Optional[str]) -> Optional[KCNode]:
+        return self.graph.nodes.get(kc_id or "")
 
-    def _store_misconceptions(
-        self,
-        sess: Session,
-        observations: List[MisconceptionObservation],
-    ) -> None:
-        for obs in observations:
-            labels = sess.misconceptions.setdefault(obs.kc_id, [])
-            if obs.label not in labels:
-                labels.append(obs.label)
-            sess.misconception_evidence.setdefault(obs.kc_id, []).append({
-                "label": obs.label,
-                "description": obs.description,
-                "question_number": obs.question_number,
-                "learner_letter": obs.learner_letter,
-                "correct_letter": obs.correct_letter,
-                "learner_choice": obs.learner_choice,
-                "correct_choice": obs.correct_choice,
-            })
+    def _kc_context(self, kc: KCNode, *, neighbours: bool = True, max_chars: int = 7000) -> str:
+        pages = self.graph.kc_pages(kc)
+        if neighbours:
+            extra: List[int] = []
+            for p in pages:
+                extra.extend([p - 1, p + 1])
+            pages = pages + [p for p in extra if p > 0]
+        return self.doc.pages_text(pages, max_chars=max_chars)
 
-    def _build_hint_ladder(
-        self,
-        kc: KCNode,
-        observations: List[MisconceptionObservation],
-        wrong_items: List[dict],
-    ) -> List[str]:
-        if observations:
-            first = observations[0]
-            contrast = (
-                f"Compare ton idee choisie ({first.learner_choice or first.learner_letter}) "
-                f"avec l'idee attendue ({first.correct_choice or first.correct_letter})."
-            )
-        elif wrong_items:
-            contrast = "Compare l'option choisie avec la bonne option et retrouve la regle de doctrine qui les separe."
+    def _source_card(self, kc: KCNode, buttons: List[Tuple[str, str]]) -> Dict[str, Any]:
+        pages = self.graph.kc_pages(kc)
+        first = pages[0] if pages else None
+        return {
+            "type": "widget",
+            "title": f"Source : {kc.title}",
+            "widget": W.source_card(
+                kc_title=kc.title,
+                pages=pages,
+                image_url=self.doc.page_image_url(first) if first else None,
+                pdf_url=self.doc.pdf_url(first) if first else None,
+                buttons=buttons,
+            ),
+        }
+
+    @staticmethod
+    def _text(text: str) -> Dict[str, Any]:
+        return {"type": "text", "text": text}
+
+    @staticmethod
+    def _actions(buttons: List[Tuple[str, str]], **kw: Any) -> Dict[str, Any]:
+        return {"type": "widget", "title": "Actions", "widget": W.actions_card(buttons, **kw)}
+
+    def _next_actions(self, sess: Session) -> List[Tuple[str, str]]:
+        """Contextual buttons: what makes sense from the current state."""
+        if sess.phase == "waiting_answers":
+            return [("Poser une question", "question")]
+        if not sess.diagnostic_done and not sess.current_kc_id:
+            return [("Commencer le diagnostic", "commencer le diagnostic"), ("Ma progression", "ma progression")]
+        buttons: List[Tuple[str, str]] = []
+        if sess.module_gate_locked and sess.pending_module_retry:
+            buttons.append(("Refaire le contrôle du chapitre", "controle"))
+        elif sess.can_advance and sess.validated_kc_id == sess.current_kc_id:
+            buttons.append(("Notion suivante", "notion suivante"))
         else:
-            contrast = "Identifie la regle de doctrine utilisee par cette KC avant de repondre."
+            buttons.append(("Lancer le quiz", "quiz"))
+            if sess.pending_hint_ladder and sess.hint_index < len(sess.pending_hint_ladder):
+                buttons.append(("Un indice", "indice"))
+        buttons.append(("Revoir la leçon", "revoir la leçon"))
+        buttons.append(("Ma progression", "ma progression"))
+        return buttons
 
-        pages = self._kc_ref_pages(kc)
-        page_hint = f" Revois la page source: {', '.join('p.' + str(p) for p in pages)}." if pages else ""
-        return [
-            f"Indice 1: Concentre-toi sur la KC '{kc.title}'.{page_hint}",
-            f"Indice 2: {contrast}",
-            "Indice 3: Elimine les options qui decrivent une KC voisine au lieu de la KC actuelle.",
-            "Dernier guidage: reformule la regle avec tes mots, puis applique-la a la situation de la question.",
-        ]
+    def _kc_label(self, kc: KCNode) -> str:
+        i = self.graph.index_by_kc.get(kc.id, 0) + 1
+        return f"Notion {i}/{len(self.graph.kc_ids())} · {kc.title}"
+
+    # =====================================================
+    # ENTRY POINTS
+    # =====================================================
+    async def handle(self, user_input: Any, ctx: AgentContext, progress: Optional[ProgressFn] = None) -> List[Dict[str, Any]]:
+        token = _progress_cv.set(progress)
+        try:
+            set_provider_from_context(getattr(ctx, "request_context", None))
+            sess = await self._load_session(self._user_id(ctx))
+            text = extract_latest_user_text(user_input).strip()
+            image_urls = extract_latest_user_image_urls(user_input)
+            try:
+                if image_urls:
+                    blocks = await self._answer_visual_question(sess, text, image_urls, ctx)
+                elif looks_like_answers(text) and sess.phase == "waiting_answers":
+                    blocks = await self._process_answers(sess, parse_answers_from_text(text), ctx)
+                else:
+                    blocks = await self._dispatch(sess, classify_command(text), text, ctx)
+            except BudgetExceeded:
+                blocks = [self._text("Vous avez atteint la limite quotidienne de générations pour ce compte de démonstration. Reprenez demain, ou ajoutez votre propre clé dans les réglages.")]
+            except Exception as exc:  # noqa: BLE001
+                print(f"[orchestrator] error: {type(exc).__name__}: {exc}")
+                blocks = [self._text(friendly_llm_error(exc)), self._actions(self._retry_actions(sess), caption="Vous pouvez réessayer.")]
+            await self._save_session(sess)
+            return blocks
+        finally:
+            _progress_cv.reset(token)
+
+    async def handle_command(self, command: str, ctx: AgentContext, progress: Optional[ProgressFn] = None) -> List[Dict[str, Any]]:
+        return await self.handle([{"role": "user", "content": [{"type": "input_text", "text": command}]}], ctx, progress)
+
+    async def handle_qcm_submit(self, submitted: Dict[int, str], ctx: AgentContext, progress: Optional[ProgressFn] = None) -> List[Dict[str, Any]]:
+        token = _progress_cv.set(progress)
+        try:
+            set_provider_from_context(getattr(ctx, "request_context", None))
+            sess = await self._load_session(self._user_id(ctx))
+            try:
+                blocks = await self._process_answers(sess, submitted, ctx)
+            except BudgetExceeded:
+                blocks = [self._text("Limite quotidienne de générations atteinte pour ce compte de démonstration.")]
+            except Exception as exc:  # noqa: BLE001
+                print(f"[orchestrator] submit error: {type(exc).__name__}: {exc}")
+                blocks = [self._text(friendly_llm_error(exc)), self._actions(self._retry_actions(sess))]
+            await self._save_session(sess)
+            return blocks
+        finally:
+            _progress_cv.reset(token)
+
+    async def handle_report(self, payload: Dict[str, Any], ctx: AgentContext) -> List[Dict[str, Any]]:
+        sess = await self._load_session(self._user_id(ctx))
+        self._record_event(sess, ctx, {
+            "event": "question_reported",
+            "quiz_id": payload.get("quiz_id"),
+            "question_id": payload.get("question_id"),
+            "number": payload.get("number"),
+            "kc_id": payload.get("kc_id"),
+        })
+        return [self._text("Merci, la question est signalée aux formateurs. Vous pouvez continuer.")]
+
+    def record_feedback(self, user_id: str, thread_id: str, item_ids: List[str], kind: str) -> None:
+        sess = self.load_session_sync(user_id)
+        enriched = {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "thread_id": thread_id,
+            "user_id": user_id,
+            "event": "item_feedback",
+            "kind": kind,
+            "item_ids": item_ids,
+            "current_kc_id": sess.current_kc_id,
+        }
+        self.store.append_event(enriched)
+
+    def peek_transition_message(self, ctx: AgentContext, raw_text: str) -> Optional[str]:
+        cmd = classify_command(raw_text or "")
+        if cmd == "start":
+            return "Je prépare un diagnostic rapide sur l'ensemble du mémento. Une trentaine de secondes."
+        if cmd == "practice":
+            return "Je prépare un quiz adapté à cette notion. Un instant."
+        if cmd == "next":
+            return "Je prépare la leçon de la notion suivante. Un instant."
+        if cmd == "checkpoint":
+            return "Je prépare le contrôle du chapitre. Un instant."
+        return None
+
+    def progress_summary(self, user_id: str) -> Dict[str, Any]:
+        sess = self.load_session_sync(user_id)
+        kc = self._kc(sess.current_kc_id)
+        total = len(self.graph.kc_ids())
+        return {
+            "course_title": self.graph.title,
+            "current_kc": {"id": kc.id, "title": kc.title, "index": self.graph.index_by_kc.get(kc.id, 0) + 1, "total": total} if kc else None,
+            "module_title": self.graph.module_title(kc.id) if kc else None,
+            "validated": len(set(sess.validated_kc_ids)),
+            "total": total,
+            "diagnostic_done": sess.diagnostic_done,
+            "quiz_pending": sess.phase == "waiting_answers",
+        }
+
+    # =====================================================
+    # DISPATCH
+    # =====================================================
+    async def _dispatch(self, sess: Session, cmd: Optional[str], text: str, ctx: Any) -> List[Dict[str, Any]]:
+        if sess.pending_reset and cmd not in {"reset_confirm", "cancel"}:
+            sess.pending_reset = False
+        if cmd == "start":
+            return await self._start_diagnostic(sess, ctx)
+        if cmd == "practice":
+            if not sess.current_kc_id:
+                return [self._text("Commencez par le diagnostic : il choisit la première notion à travailler."), self._actions([("Commencer le diagnostic", "commencer le diagnostic")])]
+            return await self._start_practice(sess, ctx)
+        if cmd == "next":
+            if not sess.current_kc_id:
+                return [self._text("Aucune notion en cours. Commencez par le diagnostic."), self._actions([("Commencer le diagnostic", "commencer le diagnostic")])]
+            return await self._next_kc(sess, ctx)
+        if cmd == "hint":
+            return [self._text(self._next_hint_text(sess)), self._actions(self._next_actions(sess))]
+        if cmd == "progress":
+            return self._show_progress(sess)
+        if cmd == "help":
+            return self._help(sess)
+        if cmd == "lesson":
+            return await self._show_lesson(sess, ctx)
+        if cmd == "checkpoint":
+            if not sess.pending_module_id or not sess.pending_module_retry:
+                return [self._text("Aucun contrôle de chapitre à refaire pour le moment."), self._actions(self._next_actions(sess))]
+            sess.pending_module_retry = False
+            return await self._start_module_quiz(sess, sess.pending_module_id, ctx)
+        if cmd == "clear_image":
+            sess.last_visual_image_urls = []
+            sess.visual_question_history = []
+            return [self._text("Photo oubliée. Envoyez-en une autre pour une nouvelle analyse.")]
+        if cmd == "reset":
+            sess.pending_reset = True
+            return [{"type": "widget", "title": "Confirmation", "widget": W.confirm_card(
+                "Effacer toute votre progression (diagnostic, notions validées, quiz en cours) ?",
+                ("Oui, tout effacer", "oui, tout effacer"), ("Non, garder", "non"))}]
+        if cmd == "reset_confirm":
+            if not sess.pending_reset:
+                return [self._text("Aucune remise à zéro en attente."), self._actions(self._next_actions(sess))]
+            fresh = Session(user_id=sess.user_id, created_at=datetime.now(timezone.utc).isoformat())
+            self._sessions[sess.user_id] = fresh
+            await self._save_session(fresh)
+            self._record_event(fresh, ctx, {"event": "session_reset"})
+            sess.__dict__.update(fresh.__dict__)
+            return [self._text("Progression effacée. On repart de zéro."), self._actions([("Commencer le diagnostic", "commencer le diagnostic")])]
+        if cmd == "cancel":
+            sess.pending_reset = False
+            return [self._text("D'accord, rien n'est effacé."), self._actions(self._next_actions(sess))]
+        if cmd == "debug":
+            return [self._text(self._debug_text(sess))]
+        if _fold(text) == "question":
+            return [self._text("Posez votre question directement dans le champ de message : je réponds avec le mémento.")]
+        if not text:
+            return self._help(sess)
+        if sess.last_visual_image_urls and sess.last_tutor_action == "answer_visual_pdf_question" and len(text) < 80:
+            return await self._answer_visual_question(sess, text, [], ctx)
+        return await self._answer_free_question(sess, text, ctx)
+
+    def _retry_actions(self, sess: Session) -> List[Tuple[str, str]]:
+        if sess.scope == "diagnostic" and not sess.diagnostic_done:
+            return [("Réessayer le diagnostic", "commencer le diagnostic")]
+        return self._next_actions(sess)
+
+    # =====================================================
+    # HELP / PROGRESS / LESSON DISPLAY
+    # =====================================================
+    def _help(self, sess: Session) -> List[Dict[str, Any]]:
+        text = (
+            "Comment ça marche\n\n"
+            "1. Un diagnostic rapide (une dizaine de questions sur tout le mémento) repère les notions à travailler. Il ne note pas, il oriente.\n"
+            "2. Pour chaque notion : une leçon courte avec la page du mémento, puis un quiz. À 70 % de bonnes réponses, la notion est validée.\n"
+            "3. En cas d'erreur : un corrigé question par question, des indices, et une reprise du quiz.\n"
+            "4. À la fin de chaque chapitre, un contrôle regroupe ses notions.\n\n"
+            "À tout moment : posez une question libre sur le mémento, envoyez la photo d'un symbole, ou cliquez sur « Ma progression ». "
+            "Les boutons sous chaque message proposent la suite ; vous pouvez aussi taper « quiz », « indice », « notion suivante », « ma progression », « aide » ou « recommencer à zéro »."
+        )
+        return [self._text(text), self._actions(self._next_actions(sess))]
+
+    def _show_progress(self, sess: Session) -> List[Dict[str, Any]]:
+        validated = set(sess.validated_kc_ids)
+        modules_out: List[Dict[str, Any]] = []
+        views: Dict[str, Dict[str, Any]] = {}
+        sec_labels: List[str] = []
+        sec_vals: List[float] = []
+        cur_module = self.graph.module_of(sess.current_kc_id) if sess.current_kc_id else None
+        for mid, title, kc_ids in self.graph.modules_in_order():
+            v = sum(1 for k in kc_ids if k in validated)
+            e = sum(1 for k in kc_ids if k not in validated and sess.diagnostic_raw_score_by_kc.get(k, 0.0) >= 1.0)
+            modules_out.append({"title": title, "total": len(kc_ids), "validated": v, "estimated": e, "current": (mid == (cur_module or "ROOT")) if cur_module or mid == "ROOT" else False})
+            vals = [self._display_mastery(sess, k) for k in kc_ids]
+            sec_labels.append(title)
+            sec_vals.append(sum(vals) / max(1, len(vals)))
+            views[f"sec::{mid}"] = {"label": f"Notions : {title}", "labels": [self.graph.nodes[k].title for k in kc_ids], "values": vals}
+        views = {"modules": {"label": "Chapitres", "labels": sec_labels, "values": sec_vals}, **views}
+        radar_html = build_radar_dashboard_html("Progression par chapitre et par notion", views, default_view="modules")
+        card = W.progress_card(
+            title="Ma progression",
+            modules=modules_out,
+            validated=len(validated),
+            total=len(self.graph.kc_ids()),
+            radar_html=radar_html,
+            buttons=[b for b in self._next_actions(sess) if b[1] != "ma progression"],
+        )
+        cur_kc = self._kc(sess.current_kc_id)
+        intro = "Diagnostic non fait : commencez par lui pour situer votre niveau." if not sess.diagnostic_done else (
+            f"Notion en cours : {cur_kc.title}." if cur_kc else "Parcours terminé.")
+        return [self._text(intro), {"type": "widget", "title": "Ma progression", "widget": card}]
+
+    def _display_mastery(self, sess: Session, kc_id: str) -> float:
+        if kc_id in sess.mastery:
+            return float(sess.mastery[kc_id])
+        return float(sess.diagnostic_profile.get(kc_id, 0.0))
+
+    async def _show_lesson(self, sess: Session, ctx: Any) -> List[Dict[str, Any]]:
+        kc = self._kc(sess.current_kc_id)
+        if not kc:
+            return [self._text("Aucune notion en cours."), self._actions([("Commencer le diagnostic", "commencer le diagnostic")])]
+        if not sess.current_micro_lesson.strip():
+            sess.current_micro_lesson = await self._build_lesson(sess, kc, ctx)
+        return [self._text(f"{self._kc_label(kc)}\n\n{sess.current_micro_lesson}"), self._source_card(kc, self._next_actions(sess))]
+
+    def _debug_text(self, sess: Session) -> str:
+        lines = [f"scope={sess.scope} phase={sess.phase} current={sess.current_kc_id} action={sess.last_tutor_action}",
+                 f"validated={sess.validated_kc_ids} weak_queue={sess.weak_queue}",
+                 f"budget={sess.llm_budget_used}/{MAX_GENERATIONS_PER_DAY} provider={current_provider.get().provider} doctrine={self.doc.source}"]
+        for kid, val in sorted(sess.mastery.items()):
+            lines.append(f"{kid} | {self.graph.nodes[kid].title if kid in self.graph.nodes else kid} | mastery={val:.2f}")
+        return "\n".join(lines)
+
+    # =====================================================
+    # DIAGNOSTIC
+    # =====================================================
+    def _sample_diagnostic_kcs(self, n: int) -> List[KCNode]:
+        """Round-robin across chapters in teaching order, so the sample spans
+        the whole memento instead of its first pages."""
+        groups = [list(kcs) for _, _, kcs in self.graph.modules_in_order()]
+        picked: List[str] = []
+        while len(picked) < n and any(groups):
+            for g in groups:
+                if g and len(picked) < n:
+                    picked.append(g.pop(0))
+        picked.sort(key=lambda k: self.graph.index_by_kc.get(k, 0))
+        return [self.graph.nodes[k] for k in picked if k in self.graph.nodes]
+
+    async def _generate_diagnostic_question(self, kc: KCNode, ctx: Any) -> List[dict]:
+        bank_q = self.bank.draw(kc.id, 1)
+        if bank_q:
+            q = dict(bank_q[0])
+            q["kc_id"] = kc.id
+            return [q]
+        pages = self.graph.kc_pages(kc)
+        prompt = (
+            f"Rédige UNE question à choix multiples de niveau diagnostic sur la notion « {kc.title} » (identifiant {kc.id}), "
+            f"à partir des pages suivantes du mémento (pages {pages}). La question doit tester un point de doctrine précis et vérifiable "
+            "dans ces pages : signification d'une forme, d'une couleur, d'un symbole, une règle, un ordre.\n\n"
+            f"{self.doc.pages_text(pages, max_chars=6000)}\n\n"
+            "Contraintes : question de moins de 240 caractères, en français ; 4 propositions courtes (moins de 90 caractères), distinctes, une seule juste ; "
+            "answer = lettre A/B/C/D ; explanation = une phrase qui justifie avec la page ; kc_id = l'identifiant fourni ; page = numéro de page source."
+        )
+        out = await run_structured("Diagnostic-QCM", INSTR_QCM, prompt, QcmList, ctx)
+        return normalize_questions(out.questions, kc.id)
+
+    async def _start_diagnostic(self, sess: Session, ctx: Any) -> List[Dict[str, Any]]:
+        kcs = self._sample_diagnostic_kcs(DIAGNOSTIC_Q_NUM)
+        if not kcs:
+            return [self._text("Le plan du cours est vide : impossible de construire le diagnostic.")]
+        self._charge_budget(sess, len(kcs))
+        done = 0
+        results: List[List[dict]] = [[] for _ in kcs]
+
+        async def one(i: int, kc: KCNode) -> None:
+            nonlocal done
+            try:
+                results[i] = await self._generate_diagnostic_question(kc, ctx)
+            except Exception as exc:  # noqa: BLE001
+                print(f"[diagnostic] {kc.id}: {type(exc).__name__}: {str(exc)[:160]}")
+                if "credit" in str(exc).lower() or "401" in str(exc):
+                    raise
+                results[i] = []
+            done += 1
+            _progress(f"Question {done}/{len(kcs)} prête", "write")
+
+        _progress(f"Diagnostic : {len(kcs)} notions tirées dans tous les chapitres", "compass")
+        await asyncio.gather(*(one(i, kc) for i, kc in enumerate(kcs)))
+        questions: List[dict] = []
+        for kc, qs in zip(kcs, results):
+            for q in qs[:1]:
+                q["kc_id"] = kc.id
+                questions.append(q)
+        if len(questions) < max(4, len(kcs) // 2):
+            raise RuntimeError(f"seulement {len(questions)} questions générées sur {len(kcs)}")
+        for i, q in enumerate(questions, start=1):
+            q["number"] = i
+        sess.scope = "diagnostic"
+        sess.phase = "waiting_answers"
+        sess.quiz_id = uuid.uuid4().hex[:12]
+        sess.quiz_questions = {str(q["number"]): q for q in questions}
+        sess.last_tutor_action = "start_diagnostic"
+        sess.pending_hint_ladder = []
+        sess.hint_index = 0
+        self._record_event(sess, ctx, {"event": "diagnostic_started", "tutor_action": sess.last_tutor_action, "n_questions": len(questions), "kc_ids": [q["kc_id"] for q in questions], "quiz_id": sess.quiz_id})
+        intro = (
+            f"Diagnostic : {len(questions)} questions, une par notion, réparties sur tous les chapitres du mémento. "
+            "Répondez au mieux, sans tricher : ce n'est pas une note, c'est ce qui me permet de choisir par quoi commencer."
+        )
+        return [self._text(intro), {"type": "qcm", "data": qcm_widget_data(f"Diagnostic · {len(questions)} questions", questions)}]
+
+    # =====================================================
+    # LESSON
+    # =====================================================
+    def _lesson_mode(self, sess: Session, kc: KCNode, level: float, attempts: int, labels: List[str]) -> Tuple[str, str]:
+        if attempts <= 0:
+            return "first_exposure", "Donne la base minimale nécessaire avant un premier quiz."
+        if level < 0.4 or labels:
+            return "remediation", "Cible précisément les erreurs commises. Ne réexplique pas toute la notion."
+        if level < THRESHOLD:
+            return "focused_review", "Revois seulement le point faible nécessaire au prochain quiz."
+        return "brief_validation", "Confirme brièvement et donne un conseil de transfert."
+
+    @staticmethod
+    def _clean_field(text: Any) -> str:
+        text = re.sub(r"\*\*|__|`", "", str(text or ""))
+        text = re.sub(r"\s*\((?:g_[a-z]\d+|KC[_ ]?\w+)\)", "", text)
+        return re.sub(r"\s+", " ", text).strip()
+
+    @classmethod
+    def _render_lesson(cls, kc: KCNode, body: Any, pages: List[int]) -> str:
+        for name in ("title", "learning_objective", "rule_to_remember", "operational_example", "common_mistake", "targeted_remediation", "self_check"):
+            setattr(body, name, cls._clean_field(getattr(body, name, "")))
+        body.essential_information = [cls._clean_field(x) for x in body.essential_information if cls._clean_field(x)]
+        lines: List[str] = [f"**{body.title or kc.title}**"]
+        if body.learning_objective:
+            lines.append(f"Objectif : {body.learning_objective}")
+        if body.essential_information:
+            lines.append("")
+            lines.append("À retenir :")
+            lines.extend(f"- {item}" for item in body.essential_information[:6])
+        if body.rule_to_remember:
+            lines.append("")
+            lines.append(f"Règle à mémoriser : {body.rule_to_remember}")
+        if body.operational_example:
+            lines.append(f"Exemple opérationnel : {body.operational_example}")
+        if body.common_mistake:
+            lines.append(f"Erreur fréquente : {body.common_mistake}")
+        if body.targeted_remediation:
+            lines.append(f"Pour corriger : {body.targeted_remediation}")
+        if body.self_check:
+            lines.append(f"Vérifiez-vous : {body.self_check}")
+        if pages:
+            lines.append("")
+            lines.append("Source : mémento GOC, " + ", ".join(f"p. {p}" for p in pages) + ".")
+        return "\n".join(lines)
+
+    async def _build_lesson(self, sess: Session, kc: KCNode, ctx: Any, mistakes_summary: str = "") -> str:
+        level = float(sess.mastery.get(kc.id, sess.diagnostic_profile.get(kc.id, 0.0)))
+        attempts = int(sess.attempts_by_kc.get(kc.id, 0))
+        labels = list(sess.misconceptions.get(kc.id, []))
+        mode, focus = self._lesson_mode(sess, kc, level, attempts, labels)
+        pages = self.graph.kc_pages(kc)
+        summary = mistakes_summary or sess.last_mistakes_summary
+        cache_key = f"cache/lesson/{current_provider.get().provider}/{kc.id}/{mode}.json" if mode in {"first_exposure", "brief_validation"} else None
+        cached = await self.store.aget_json(cache_key, None) if cache_key else None
+        if isinstance(cached, dict) and cached.get("text"):
+            text = str(cached["text"])
+            plan = cached.get("plan") or {}
+        else:
+            self._charge_budget(sess)
+            _progress(f"Leçon sur « {kc.title} »", "book-open")
+            prompt = (
+                f"Notion à enseigner : « {kc.title} » (identifiant {kc.id}), pages {pages} du mémento.\n"
+                f"Niveau estimé de l'apprenant sur cette notion : {level:.2f} (0 = rien, 1 = maîtrise ; une estimation issue du diagnostic n'est pas une validation).\n"
+                f"Tentatives de quiz sur cette notion : {attempts}. Mode de leçon : {mode}. Consigne : {focus}\n"
+                f"Confusions détectées : {labels or 'aucune'}\n"
+                f"Erreurs récentes : {summary or 'aucune'}\n\n"
+                f"Extrait du mémento (source unique autorisée) :\n{self._kc_context(kc)}\n\n"
+                "Rédige la leçon en français, courte mais complète sur la doctrine de cette notion : essential_information = 3 à 6 points précis "
+                "(formes, couleurs, symboles, règles avec leur signification exacte), rule_to_remember = la règle en une phrase, "
+                "operational_example = une situation concrète de sapeur-pompier, common_mistake = la confusion typique, self_check = une question "
+                "d'auto-vérification. Conserve les termes officiels du mémento tels quels. N'invente aucune règle absente de l'extrait."
+            )
+            out = await run_structured("Micro-lesson", INSTR_LESSON, prompt, LessonOut, ctx)
+            text = self._render_lesson(kc, out.lesson, pages)
+            plan = out.lesson_plan.model_dump()
+            if cache_key:
+                await self.store.aput_json(cache_key, {"text": text, "plan": plan, "created_at": datetime.now(timezone.utc).isoformat()})
+        self._record_event(sess, ctx, {
+            "event": "micro_lesson_generated", "kc_id": kc.id, "kc_title": kc.title, "mastery": sess.mastery.get(kc.id),
+            "diagnostic_level": sess.diagnostic_profile.get(kc.id), "learner_level_for_adaptation": level, "attempts": attempts,
+            "misconceptions": labels, "source_pages": pages, "word_estimate": len(text.split()), "lesson_plan": plan,
+            "lesson_budget_words": plan.get("max_words"), "lesson_mode": mode, "lesson_preview": text[:1200], "cached": bool(cached),
+        })
+        return text
+
+    # =====================================================
+    # PRACTICE
+    # =====================================================
+    async def _essential_targets(self, sess: Session, kc: KCNode, ctx: Any) -> List[str]:
+        cached = sess.kc_essential_targets.get(kc.id)
+        if cached:
+            return cached
+        pages = self.graph.kc_pages(kc)
+        rules = self.doc.rules_for_pages(pages)
+        if len(rules) >= 3:
+            targets = rules[:10]
+        else:
+            shared_key = f"cache/targets/{kc.id}.json"
+            shared = await self.store.aget_json(shared_key, None)
+            if isinstance(shared, list) and shared:
+                targets = [str(t) for t in shared]
+            else:
+                self._charge_budget(sess)
+                prompt = (
+                    f"Notion : « {kc.title} », pages {pages}.\n\nExtrait du mémento :\n{self._kc_context(kc, neighbours=False)}\n\n"
+                    "Liste 3 à 8 cibles d'évaluation précises et testables par QCM pour cette notion (une règle ou un fait par cible, "
+                    "en français, sans doublon, sans formulation vague du type « comprendre la leçon »)."
+                )
+                out = await run_structured("KC-targets", INSTR_TARGETS, prompt, EssentialTargets, ctx)
+                targets = [re.sub(r"\s+", " ", t).strip() for t in out.essential_targets if t.strip()][:10]
+                if targets:
+                    await self.store.aput_json(shared_key, targets)
+        sess.kc_essential_targets[kc.id] = targets
+        return targets
+
+    async def _start_practice(self, sess: Session, ctx: Any) -> List[Dict[str, Any]]:
+        kc = self._kc(sess.current_kc_id)
+        if not kc:
+            return [self._text("Notion introuvable dans le plan du cours.")]
+        sess.can_advance = False
+        sess.validated_kc_id = None
+        if not sess.current_micro_lesson.strip():
+            sess.current_micro_lesson = await self._build_lesson(sess, kc, ctx)
+            sess.last_mistakes_summary = ""
+        mastery = float(sess.mastery.get(kc.id, 0.0))
+        attempts_before = int(sess.attempts_by_kc.get(kc.id, 0))
+        difficulty = "easy" if attempts_before <= 0 or mastery < 0.4 else ("medium" if mastery < THRESHOLD else "hard")
+        review_kcs = [self.graph.nodes[i] for i in self.graph.previous_kcs(kc.id, limit=2) if i in self.graph.nodes]
+        targets = await self._essential_targets(sess, kc, ctx)
+        mistakes = sess.last_mistakes_summary.strip()
+        mistake_count = len(re.findall(r"\bQ\d+", mistakes))
+        target_n = min(len(targets), 6) + min(2, mistake_count) + (1 if review_kcs and difficulty != "easy" else 0)
+        min_q = max(PRACTICE_MIN_Q, min(PRACTICE_MAX_Q, target_n))
+        max_q = max(min_q, min(PRACTICE_MAX_Q, min_q + 2))
+        seen = set(sess.seen_question_ids)
+        from_bank = False
+        questions: List[dict] = []
+        if self.bank.count(kc.id) >= min_q:
+            questions = self.bank.draw(kc.id, min_q, exclude_ids=seen, difficulty=difficulty)
+            from_bank = bool(questions)
+        coverage_plan: Any = []
+        if not questions:
+            self._charge_budget(sess)
+            _progress(f"Quiz sur « {kc.title} » ({min_q} à {max_q} questions)", "write")
+            targets_payload = [{"target_id": f"E{i}", "target": t} for i, t in enumerate(targets, start=1)]
+            review_payload = [{"id": r.id, "title": r.title} for r in review_kcs]
+            prompt = (
+                f"Notion à valider : « {kc.title} » ({kc.id}). Difficulté : {difficulty} "
+                "(easy = reconnaissance et définitions ; medium = application ; hard = transfert, comparaison, distracteurs plausibles).\n"
+                f"Nombre de questions attendu : entre {min_q} et {max_q}.\n"
+                f"Cibles à couvrir (au moins une question par cible) : {targets_payload}\n"
+                f"Notions précédentes utilisables pour 1 question d'intégration au plus (la question doit rester centrée sur la notion actuelle) : {review_payload or 'aucune'}\n"
+                f"Erreurs récentes de l'apprenant à retravailler : {mistakes or 'aucune (premier essai)'}\n"
+                f"Questions déjà posées à cet apprenant (formule des questions DIFFÉRENTES, angle ou exemple nouveau) : {sess.recent_stems.get(kc.id, [])[-12:] or 'aucune'}\n\n"
+                f"Leçon reçue par l'apprenant :\n{sess.current_micro_lesson}\n\n"
+                f"Extrait du mémento (source unique autorisée) :\n{self._kc_context(kc)}\n\n"
+                "Contraintes : questions en français de moins de 240 caractères, 4 propositions courtes (moins de 90 caractères) et distinctes, une seule juste, "
+                "answer = lettre, explanation = une phrase de justification avec la page, target_id = E1.. ou M1.. pour une erreur, page = page source, "
+                "pas de question dont la réponse est visible dans l'énoncé, pas de doublon, coverage_plan qui liste chaque cible avec ses numéros de question."
+            )
+            out = await run_structured("Practice-QCM", INSTR_PRACTICE, prompt, PracticePack, ctx)
+            questions = normalize_questions(out.questions, kc.id)
+            coverage_plan = [c.model_dump() for c in out.coverage_plan]
+            if len(questions) < min(PRACTICE_MIN_Q, 3):
+                raise RuntimeError(f"quiz inexploitable ({len(questions)} questions valides)")
+            questions = questions[:max_q]
+        for i, q in enumerate(questions, start=1):
+            q["number"] = i
+            q["kc_id"] = kc.id
+        sess.scope = "practice"
+        sess.phase = "waiting_answers"
+        sess.quiz_id = uuid.uuid4().hex[:12]
+        sess.quiz_questions = {str(q["number"]): q for q in questions}
+        sess.attempts_by_kc[kc.id] = attempts_before + 1
+        sess.last_tutor_action = f"generate_{difficulty}_practice"
+        sess.pending_hint_ladder = []
+        sess.hint_index = 0
+        sess.seen_question_ids = (sess.seen_question_ids + [str(q.get("id")) for q in questions if q.get("id")])[-400:]
+        sess.recent_stems[kc.id] = (sess.recent_stems.get(kc.id, []) + [q["text"] for q in questions])[-24:]
+        expected = {f"E{i}" for i in range(1, len(targets) + 1)}
+        covered = {str(c.get("target_id")) for c in coverage_plan if isinstance(c, dict) and c.get("question_numbers")} if isinstance(coverage_plan, list) else set()
+        self._record_event(sess, ctx, {
+            "event": "practice_started", "tutor_action": sess.last_tutor_action, "kc_id": kc.id, "kc_title": kc.title, "difficulty": difficulty,
+            "attempt": sess.attempts_by_kc[kc.id], "mastery_before": mastery, "n_questions": len(questions), "practice_min_questions": min_q,
+            "practice_max_questions": max_q, "lesson_essential_count": len(targets), "lesson_essential_targets": targets,
+            "practice_essential_targets": targets, "missing_coverage_target_ids": sorted(expected - covered) if not from_bank else [],
+            "coverage_plan": coverage_plan, "review_kc_ids": [r.id for r in review_kcs], "review_kc_titles": [r.title for r in review_kcs],
+            "source_pages": self.graph.kc_pages(kc), "from_bank": from_bank, "quiz_id": sess.quiz_id,
+            "practice_length_strategy": {"basis": "targets + mistakes + integration", "difficulty": difficulty, "attempts_before": attempts_before, "mistake_count": mistake_count},
+        })
+        title = f"Quiz · {kc.title} · {len(questions)} questions"
+        lead = f"Quiz sur « {kc.title} » : {len(questions)} questions. Validez à partir de {THRESHOLD:.0%} de bonnes réponses."
+        return [self._text(lead), {"type": "qcm", "data": qcm_widget_data(title, questions)}]
+
+    # =====================================================
+    # MODULE CHECKPOINT
+    # =====================================================
+    async def _start_module_quiz(self, sess: Session, module_id: str, ctx: Any) -> List[Dict[str, Any]]:
+        kc_ids = self.graph.module_kcs(module_id)
+        kcs = [self.graph.nodes[i] for i in kc_ids if i in self.graph.nodes]
+        title = self.graph.nodes[module_id].title if module_id in self.graph.nodes else "Chapitre"
+        if not kcs:
+            sess.module_gate_locked = False
+            sess.pending_module_id = None
+            return [self._text("Ce chapitre n'a pas de notion à contrôler."), self._actions(self._next_actions(sess))]
+        n_q = max(MODULE_MIN_Q, min(MODULE_MAX_Q, len(kcs) * 2))
+        per_kc = max(1, n_q // len(kcs))
+        questions: List[dict] = []
+        for kc in kcs:
+            drawn = self.bank.draw(kc.id, per_kc, exclude_ids=set(sess.seen_question_ids))
+            for q in drawn:
+                q["kc_id"] = kc.id
+            questions.extend(drawn)
+        if len(questions) < n_q:
+            self._charge_budget(sess)
+            _progress(f"Contrôle du chapitre « {title} »", "check-circle")
+            pages: List[int] = []
+            for kc in kcs:
+                pages.extend(self.graph.kc_pages(kc))
+            need = n_q - len(questions)
+            prompt = (
+                f"Chapitre : « {title} ». Notions à couvrir (utilise leurs identifiants dans kc_id) : {[{'id': k.id, 'title': k.title} for k in kcs]}\n"
+                f"Rédige {need} questions de contrôle réparties sur ces notions (au moins une par notion si possible), difficulté moyenne, "
+                "en français, chacune vérifiable dans l'extrait ci-dessous.\n\n"
+                f"{self.doc.pages_text(pages, max_chars=9000)}\n\n"
+                "Contraintes : question de moins de 240 caractères ; 4 propositions courtes et distinctes ; une seule juste ; answer = lettre ; "
+                "explanation = une phrase avec la page ; kc_id = identifiant de la notion testée ; page = page source ; pas de doublon."
+            )
+            out = await run_structured("Module-QCM", INSTR_QCM, prompt, QcmList, ctx)
+            generated = normalize_questions(out.questions, kcs[0].id)
+            valid_ids = {k.id for k in kcs}
+            for q in generated:
+                if q["kc_id"] not in valid_ids:
+                    q["kc_id"] = kcs[0].id
+            questions.extend(generated[:need])
+        if len(questions) < max(3, MODULE_MIN_Q // 2):
+            raise RuntimeError("contrôle de chapitre inexploitable")
+        for i, q in enumerate(questions, start=1):
+            q["number"] = i
+        sess.scope = "module_quiz"
+        sess.phase = "waiting_answers"
+        sess.quiz_id = uuid.uuid4().hex[:12]
+        sess.quiz_questions = {str(q["number"]): q for q in questions}
+        sess.last_tutor_action = "start_module_checkpoint"
+        sess.pending_hint_ladder = []
+        sess.hint_index = 0
+        self._record_event(sess, ctx, {"event": "module_checkpoint_started", "tutor_action": sess.last_tutor_action, "module_id": module_id, "module_title": title, "kc_ids": kc_ids, "n_questions": len(questions), "quiz_id": sess.quiz_id})
+        lead = f"Contrôle du chapitre « {title} » : {len(questions)} questions sur ses {len(kcs)} notions. Seuil : {MODULE_THRESHOLD:.0%}."
+        return [self._text(lead), {"type": "qcm", "data": qcm_widget_data(f"Contrôle · {title}", questions)}]
+
+    # =====================================================
+    # SCORING
+    # =====================================================
+    def _score(self, sess: Session, answers: Dict[int, str]) -> Tuple[float, Dict[str, Tuple[int, int]], List[dict]]:
+        per: Dict[str, Tuple[int, int]] = {}
+        items: List[dict] = []
+        correct_total = 0
+        for num_s, q in sorted(sess.quiz_questions.items(), key=lambda kv: int(kv[0])):
+            num = int(num_s)
+            learner = str(answers.get(num, "") or "").upper()[:1]
+            correct = str(q.get("answer") or "").upper()
+            ok = learner == correct
+            correct_total += 1 if ok else 0
+            c, t = per.get(q["kc_id"], (0, 0))
+            per[q["kc_id"]] = (c + (1 if ok else 0), t + 1)
+            choices = q.get("choices") or []
+            items.append({
+                "id": q.get("id"), "number": num, "question": q.get("text", ""), "choices": choices, "kc_id": q["kc_id"],
+                "correct": ok, "learner_letter": learner or "-", "correct_letter": correct,
+                "learner_choice": choices[LETTERS.index(learner)] if learner in LETTERS and len(choices) == 4 else "",
+                "correct_choice": choices[LETTERS.index(correct)] if correct in LETTERS and len(choices) == 4 else "",
+                "explanation": q.get("explanation", ""), "page": q.get("page"),
+            })
+        total = len(sess.quiz_questions) or 1
+        return correct_total / total, per, items
+
+    def _correction_block(self, sess: Session, items: List[dict], score: float, passed: Optional[bool], title: str) -> Dict[str, Any]:
+        n_ok = sum(1 for it in items if it["correct"])
+        return {"type": "widget", "title": title, "widget": W.correction_card(
+            title, items, score_label=f"{n_ok}/{len(items)} · {score:.0%}", passed=passed, quiz_id=sess.quiz_id,
+            kc_id=sess.current_kc_id or "")}
+
+    def _clear_quiz(self, sess: Session) -> None:
+        sess.quiz_questions = {}
+        sess.phase = "idle"
+
+    async def _process_answers(self, sess: Session, answers: Dict[int, str], ctx: Any) -> List[Dict[str, Any]]:
+        if sess.phase != "waiting_answers" or not sess.quiz_questions:
+            return [self._text("Aucun quiz en attente de réponses."), self._actions(self._next_actions(sess))]
+        overall, per_kc, items = self._score(sess, answers)
+        mastery_before = dict(sess.mastery)
+        wrong_items = [it for it in items if not it["correct"]]
+        for kc_id, (c, t) in per_kc.items():
+            score = c / t if t else 1.0
+            sess.last_score_by_kc[kc_id] = score
+            if sess.scope == "diagnostic":
+                sess.diagnostic_raw_score_by_kc[kc_id] = score
+                sess.diagnostic_profile[kc_id] = DIAGNOSTIC_MIN_MASTERY + score * (DIAGNOSTIC_MAX_MASTERY - DIAGNOSTIC_MIN_MASTERY)
+                continue
+            alpha = 0.6 if sess.scope == "practice" else 0.4
+            sess.mastery[kc_id] = score if kc_id not in sess.mastery else (1 - alpha) * sess.mastery[kc_id] + alpha * score
+
+        if sess.scope == "diagnostic":
+            return await self._after_diagnostic(sess, ctx, overall, per_kc, items, mastery_before)
+        if sess.scope == "module_quiz":
+            return await self._after_module(sess, ctx, overall, items, wrong_items, mastery_before)
+        return await self._after_practice(sess, ctx, per_kc, items, wrong_items, mastery_before)
+
+    async def _after_diagnostic(self, sess: Session, ctx: Any, overall: float, per_kc: Dict[str, Tuple[int, int]], items: List[dict], mastery_before: Dict[str, float]) -> List[Dict[str, Any]]:
+        weak = [k for k in self.graph.kc_ids() if k in per_kc and per_kc[k][0] < per_kc[k][1]]
+        sess.weak_queue = weak
+        sess.diagnostic_done = True
+        first = weak[0] if weak else self.graph.kc_ids()[0]
+        sess.current_kc_id = first
+        kc = self.graph.nodes[first]
+        self._clear_quiz(sess)
+        sess.scope = "practice"
+        sess.current_micro_lesson = ""
+        sess.last_mistakes_summary = ""
+        sess.last_tutor_action = "diagnose_weak_kc_then_micro_lesson"
+        correction = self._correction_block(sess, items, overall, None, "Corrigé du diagnostic")
+        self._record_event(sess, ctx, {
+            "event": "diagnostic_submitted", "tutor_action": sess.last_tutor_action, "evidence_role": "screening_only",
+            "mastery_interpretation": "Diagnostic estimates candidate weakness; it does not validate mastery.",
+            "diagnostic_mastery_cap": {"min": DIAGNOSTIC_MIN_MASTERY, "max": DIAGNOSTIC_MAX_MASTERY},
+            "overall_score": overall, "weakness_kc_id": first, "weakness_kc_title": kc.title, "weak_queue": weak, "per_kc": per_kc,
+            "diagnostic_raw_score_by_kc": dict(sess.diagnostic_raw_score_by_kc), "diagnostic_profile": dict(sess.diagnostic_profile),
+            "mastery_before": mastery_before, "mastery_after": dict(sess.mastery), "mastery_update": "none_from_diagnostic",
+            "source_pages": self.graph.kc_pages(kc), "quiz_id": sess.quiz_id,
+        })
+        lesson = await self._build_lesson(sess, kc, ctx)
+        sess.current_micro_lesson = lesson
+        n_ok = sum(1 for it in items if it["correct"])
+        if weak:
+            names = ", ".join(self.graph.nodes[k].title for k in weak[:4]) + (" et d'autres" if len(weak) > 4 else "")
+            summary = (
+                f"Diagnostic terminé : {n_ok}/{len(items)} bonnes réponses. Ce n'est qu'une estimation.\n"
+                f"Notions à travailler en priorité : {names}.\n\n"
+                f"On commence par « {kc.title} ». Lisez la leçon, puis lancez le quiz."
+            )
+        else:
+            summary = (
+                f"Diagnostic terminé : {n_ok}/{len(items)}, tout juste. Une question par notion ne prouve pas la maîtrise : "
+                f"le parcours reprend depuis le début, en mode rapide. Première notion : « {kc.title} »."
+            )
+        return [correction, self._text(summary), self._text(f"{self._kc_label(kc)}\n\n{lesson}"), self._source_card(kc, [("Lancer le quiz", "quiz"), ("Ma progression", "ma progression")])]
+
+    async def _after_practice(self, sess: Session, ctx: Any, per_kc: Dict[str, Tuple[int, int]], items: List[dict], wrong_items: List[dict], mastery_before: Dict[str, float]) -> List[Dict[str, Any]]:
+        kc = self._kc(sess.current_kc_id)
+        if not kc:
+            self._clear_quiz(sess)
+            return [self._text("Notion en cours introuvable.")]
+        c, t = per_kc.get(kc.id, (0, len(sess.quiz_questions)))
+        score = c / max(1, t)
+        self._clear_quiz(sess)
+        quiz_id = sess.quiz_id
+        if score < THRESHOLD:
+            sess.can_advance = False
+            sess.validated_kc_id = None
+            labels: List[str] = []
+            for wi in wrong_items:
+                lab = f"confond « {wi.get('learner_choice') or wi.get('learner_letter')} » avec « {wi.get('correct_choice') or wi.get('correct_letter')} »"
+                labels.append(lab)
+            sess.misconceptions[kc.id] = (sess.misconceptions.get(kc.id, []) + labels)[-6:]
+            sess.last_mistakes_summary = "\n".join(f"Q{wi['number']}: répondu {wi['learner_letter']} ({wi.get('learner_choice')}) au lieu de {wi['correct_letter']} ({wi.get('correct_choice')}) | {wi['question'][:160]}" for wi in wrong_items[:8])
+            action = "hint_ladder_then_remediate" if labels else "retry_with_micro_lesson"
+            sess.last_tutor_action = action
+            self._charge_budget(sess)
+            _progress("Analyse de vos erreurs", "lightbulb")
+            fb = await self._feedback(kc, wrong_items, score, ctx)
+            sess.pending_hint_ladder = [h for h in fb.hints if h.strip()][:3] or [
+                f"Relisez la page {self.graph.kc_pages(kc)[0] if self.graph.kc_pages(kc) else ''} du mémento en cherchant la règle qui sépare vos réponses des bonnes.",
+                "Comparez la forme, la couleur et l'état de chaque symbole : lequel change le sens ?",
+                "Reformulez la règle avec vos mots, puis appliquez-la à la question ratée.",
+            ]
+            sess.hint_index = 0
+            blocks: List[Dict[str, Any]] = [self._correction_block(sess, items, score, False, f"Corrigé · {kc.title}")]
+            if score < REMEDIATION_LESSON_BELOW:
+                lesson = await self._build_lesson(sess, kc, ctx, mistakes_summary=sess.last_mistakes_summary)
+                sess.current_micro_lesson = lesson
+                blocks.append(self._text(f"Notion non validée ({score:.0%}, seuil {THRESHOLD:.0%}).\n\n{fb.summary}\n\nLeçon de reprise :\n\n{lesson}"))
+            else:
+                blocks.append(self._text(f"Notion non validée ({score:.0%}, seuil {THRESHOLD:.0%}), mais vous n'êtes pas loin.\n\n{fb.summary}"))
+            self._record_event(sess, ctx, {
+                "event": "practice_submitted", "tutor_action": action, "decision_reason": "score below threshold", "kc_id": kc.id, "kc_title": kc.title,
+                "score": score, "threshold": THRESHOLD, "passed": False, "wrong_items": wrong_items, "misconceptions": labels,
+                "mastery_before": mastery_before, "mastery_after": dict(sess.mastery), "attempt": sess.attempts_by_kc.get(kc.id, 0),
+                "source_pages": self.graph.kc_pages(kc), "quiz_id": quiz_id, "hints": sess.pending_hint_ladder,
+            })
+            blocks.append(self._source_card(kc, [("Refaire le quiz", "quiz"), ("Un indice", "indice"), ("Revoir la leçon", "revoir la leçon")]))
+            return blocks
+
+        sess.can_advance = True
+        sess.validated_kc_id = kc.id
+        if kc.id not in sess.validated_kc_ids:
+            sess.validated_kc_ids.append(kc.id)
+        sess.weak_queue = [k for k in sess.weak_queue if k != kc.id]
+        sess.pending_hint_ladder = []
+        sess.hint_index = 0
+        nxt = self.graph.next_kc(kc.id)
+        sess.pending_next_kc_id = nxt if nxt in self.graph.nodes else None
+        cur_module = self.graph.module_of(kc.id)
+        next_module = self.graph.module_of(nxt) if nxt else None
+        blocks = [self._correction_block(sess, items, score, True, f"Corrigé · {kc.title}")]
+        if cur_module and (not nxt or next_module != cur_module):
+            sess.pending_module_id = cur_module
+            sess.module_gate_locked = True
+            sess.pending_module_retry = False
+            sess.last_tutor_action = "validate_kc_then_module_checkpoint"
+            self._record_event(sess, ctx, {
+                "event": "practice_submitted", "tutor_action": sess.last_tutor_action, "decision_reason": "KC validated, end of module", "kc_id": kc.id,
+                "kc_title": kc.title, "score": score, "threshold": THRESHOLD, "passed": True, "mastery_before": mastery_before,
+                "mastery_after": dict(sess.mastery), "attempt": sess.attempts_by_kc.get(kc.id, 0), "source_pages": self.graph.kc_pages(kc),
+                "module_id": cur_module, "quiz_id": quiz_id,
+            })
+            blocks.append(self._text(f"Notion validée : « {kc.title} » ({score:.0%}). C'était la dernière du chapitre « {self.graph.module_title(kc.id)} » : place au contrôle du chapitre."))
+            blocks.extend(await self._start_module_quiz(sess, cur_module, ctx))
+            return blocks
+        sess.last_tutor_action = "validate_kc"
+        self._record_event(sess, ctx, {
+            "event": "practice_submitted", "tutor_action": "validate_kc", "decision_reason": "score reached threshold", "kc_id": kc.id, "kc_title": kc.title,
+            "score": score, "threshold": THRESHOLD, "passed": True, "mastery_before": mastery_before, "mastery_after": dict(sess.mastery),
+            "attempt": sess.attempts_by_kc.get(kc.id, 0), "source_pages": self.graph.kc_pages(kc), "next_kc_id": sess.pending_next_kc_id, "quiz_id": quiz_id,
+        })
+        if sess.pending_next_kc_id:
+            next_kc = self.graph.nodes[sess.pending_next_kc_id]
+            blocks.append(self._text(f"Notion validée : « {kc.title} » ({score:.0%}). Suivante : « {next_kc.title} »."))
+            blocks.append(self._actions([("Notion suivante", "notion suivante"), ("Ma progression", "ma progression"), ("Poser une question", "question")]))
+        else:
+            blocks.append(self._text(f"Notion validée : « {kc.title} » ({score:.0%}). Vous avez terminé le parcours du mémento."))
+            blocks.append(self._actions([("Ma progression", "ma progression")]))
+        return blocks
+
+    async def _after_module(self, sess: Session, ctx: Any, score: float, items: List[dict], wrong_items: List[dict], mastery_before: Dict[str, float]) -> List[Dict[str, Any]]:
+        module_id = sess.pending_module_id
+        title = self.graph.nodes[module_id].title if module_id and module_id in self.graph.nodes else "Chapitre"
+        self._clear_quiz(sess)
+        quiz_id = sess.quiz_id
+        if module_id:
+            sess.module_mastery[module_id] = score
+        blocks = [self._correction_block(sess, items, score, score >= MODULE_THRESHOLD, f"Corrigé · contrôle « {title} »")]
+        if score < MODULE_THRESHOLD:
+            sess.module_gate_locked = True
+            sess.pending_module_retry = True
+            sess.last_tutor_action = "retry_module_checkpoint"
+            sess.scope = "practice"
+            self._record_event(sess, ctx, {"event": "module_checkpoint_submitted", "tutor_action": sess.last_tutor_action, "decision_reason": "score below threshold", "module_id": module_id, "score": score, "threshold": MODULE_THRESHOLD, "wrong_items": wrong_items, "mastery_before": mastery_before, "mastery_after": dict(sess.mastery), "quiz_id": quiz_id})
+            weak_titles = sorted({self.graph.nodes[it["kc_id"]].title for it in wrong_items if it["kc_id"] in self.graph.nodes})
+            blocks.append(self._text(f"Chapitre non validé ({score:.0%}, seuil {MODULE_THRESHOLD:.0%}). Notions à revoir : {', '.join(weak_titles) or 'voir le corrigé'}. Relisez les pages indiquées, puis refaites le contrôle."))
+            blocks.append(self._actions([("Refaire le contrôle du chapitre", "controle"), ("Revoir la leçon", "revoir la leçon"), ("Poser une question", "question")]))
+            return blocks
+        sess.module_gate_locked = False
+        sess.pending_module_id = None
+        sess.pending_module_retry = False
+        sess.last_tutor_action = "validate_module"
+        nxt = sess.pending_next_kc_id
+        self._record_event(sess, ctx, {"event": "module_checkpoint_submitted", "tutor_action": sess.last_tutor_action, "decision_reason": "score reached threshold", "module_id": module_id, "score": score, "threshold": MODULE_THRESHOLD, "wrong_items": wrong_items, "mastery_before": mastery_before, "mastery_after": dict(sess.mastery), "next_kc_id": nxt, "quiz_id": quiz_id})
+        if not nxt or nxt not in self.graph.nodes:
+            blocks.append(self._text(f"Chapitre « {title} » validé ({score:.0%}). Vous avez terminé le parcours du mémento."))
+            blocks.append(self._actions([("Ma progression", "ma progression")]))
+            return blocks
+        blocks.append(self._text(f"Chapitre « {title} » validé ({score:.0%})."))
+        blocks.extend(await self._next_kc(sess, ctx, force=True))
+        return blocks
+
+    async def _feedback(self, kc: KCNode, wrong_items: List[dict], score: float, ctx: Any) -> Feedback:
+        payload = [{"question": wi["question"], "reponse_donnee": f"{wi['learner_letter']}) {wi.get('learner_choice')}", "bonne_reponse": f"{wi['correct_letter']}) {wi.get('correct_choice')}", "justification": wi.get("explanation", "")} for wi in wrong_items[:6]]
+        prompt = (
+            f"Notion : « {kc.title} ». Score : {score:.0%}. Erreurs :\n{json.dumps(payload, ensure_ascii=False)}\n\n"
+            f"Extrait du mémento :\n{self._kc_context(kc, neighbours=False, max_chars=5000)}\n\n"
+            "Rédige en français : summary = 2 à 4 phrases (lecture du score, les corrections essentielles regroupées, une mini-remédiation concrète) ; "
+            "corrections = une phrase par erreur importante ; hints = 3 indices progressifs, spécifiques aux questions ratées, qui guident vers la règle "
+            "sans donner la réponse (le premier oriente vers la page et le bon critère, le deuxième élimine une confusion, le troisième formule presque la règle)."
+        )
+        try:
+            return await run_structured("Feedback", INSTR_FEEDBACK, prompt, Feedback, ctx)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[feedback] {type(exc).__name__}: {str(exc)[:160]}")
+            return Feedback(summary="Regardez le corrigé ci-dessus : chaque bonne réponse est justifiée avec sa page. Relisez la page, puis refaites le quiz.", corrections=[], hints=[])
 
     def _next_hint_text(self, sess: Session) -> str:
         if not sess.pending_hint_ladder:
-            return "Aucun indice en attente. Tape: practice"
+            return "Aucun indice en attente : les indices apparaissent après un quiz non validé."
         idx = min(sess.hint_index, len(sess.pending_hint_ladder) - 1)
         hint = sess.pending_hint_ladder[idx]
         sess.hint_index = min(idx + 1, len(sess.pending_hint_ladder))
         if sess.hint_index >= len(sess.pending_hint_ladder):
-            return f"{hint}\n\nIl n'y a plus d'indices. Tape: practice"
-        return f"{hint}\n\nTape: hint pour l'indice suivant, ou practice pour refaire le QCM."
+            return f"Indice {idx + 1}/{len(sess.pending_hint_ladder)} : {hint}\n\nC'était le dernier indice. Refaites le quiz quand vous êtes prêt."
+        return f"Indice {idx + 1}/{len(sess.pending_hint_ladder)} : {hint}"
 
-    def _clear_quiz_state(self, sess: Session) -> None:
-        sess.last_hidden_answers = {}
-        sess.last_question_to_kc = {}
-        sess.last_question_text = {}
-        self.hidden_answers = None
+    # =====================================================
+    # NEXT NOTION
+    # =====================================================
+    async def _next_kc(self, sess: Session, ctx: Any, *, force: bool = False) -> List[Dict[str, Any]]:
+        if not force:
+            if not sess.can_advance or sess.validated_kc_id != sess.current_kc_id:
+                return [self._text("Validez d'abord la notion en cours avec le quiz (70 % de bonnes réponses)."), self._actions([("Lancer le quiz", "quiz"), ("Revoir la leçon", "revoir la leçon")])]
+            if sess.module_gate_locked:
+                mod = self.graph.nodes[sess.pending_module_id].title if sess.pending_module_id in self.graph.nodes else "chapitre"
+                return [self._text(f"Le contrôle du chapitre « {mod} » doit être réussi avant de continuer."), self._actions([("Refaire le contrôle du chapitre", "controle")] if sess.pending_module_retry else [("Poser une question", "question")])]
+        nxt = sess.pending_next_kc_id or self.graph.next_kc(sess.current_kc_id or "")
+        if not nxt or nxt not in self.graph.nodes:
+            sess.can_advance = False
+            sess.validated_kc_id = None
+            sess.pending_next_kc_id = None
+            return [self._text("Vous avez terminé le parcours du mémento. Bravo."), self._actions([("Ma progression", "ma progression")])]
+        sess.current_kc_id = nxt
+        sess.pending_next_kc_id = None
+        sess.scope = "practice"
+        sess.phase = "idle"
+        sess.last_mistakes_summary = ""
+        sess.current_micro_lesson = ""
+        sess.can_advance = False
+        sess.validated_kc_id = None
+        sess.pending_hint_ladder = []
+        sess.hint_index = 0
+        kc = self.graph.nodes[nxt]
+        lesson = await self._build_lesson(sess, kc, ctx)
+        sess.current_micro_lesson = lesson
+        known = sess.diagnostic_raw_score_by_kc.get(kc.id, 0.0) >= 1.0
+        note = " Vous aviez juste au diagnostic : la leçon est courte, le quiz confirmera." if known else ""
+        return [self._text(f"{self._kc_label(kc)} · chapitre « {self.graph.module_title(kc.id)} ».{note}\n\n{lesson}"), self._source_card(kc, [("Lancer le quiz", "quiz"), ("Poser une question", "question")])]
 
-    def _learning_frontier(self, current_kc_id: str) -> Tuple[List[KCNode], List[KCNode]]:
-        ordered = self.graph.kc_ids()
-        idx = self.graph.index_by_kc.get(current_kc_id)
-        if idx is None:
-            return [], []
-        allowed_ids = ordered[: idx + 1]
-        future_ids = ordered[idx + 1 :]
-        allowed = [self.graph.nodes[kid] for kid in allowed_ids if kid in self.graph.nodes]
-        future = [self.graph.nodes[kid] for kid in future_ids if kid in self.graph.nodes]
-        return allowed, future
-
-    async def _answer_learner_question(self, sess: Session, question: str, ctx: AgentContext) -> Any:
-        if not sess.current_kc_id or sess.current_kc_id not in self.graph.nodes:
-            return (
-                "I can answer lesson questions after a KC is selected. "
-                "Type: start diagnostic"
-            )
-
-        current_kc = self.graph.nodes[sess.current_kc_id]
-        allowed_kcs, future_kcs = self._learning_frontier(current_kc.id)
-        answer = await self.learner_question.answer(
-            question=question,
-            current_kc=current_kc,
-            allowed_kcs=allowed_kcs,
-            future_kcs=future_kcs,
-            current_micro_lesson=sess.current_micro_lesson,
-            ctx=ctx,
+    # =====================================================
+    # FREE QUESTIONS AND IMAGES
+    # =====================================================
+    async def _answer_free_question(self, sess: Session, question: str, ctx: Any) -> List[Dict[str, Any]]:
+        self._charge_budget(sess)
+        kc = self._kc(sess.current_kc_id)
+        pages: List[int] = list(self.graph.kc_pages(kc)) if kc else []
+        found = self.doc.search_pages(question, k=3)
+        pages = pages + [p for p in found if p not in pages]
+        if not pages:
+            pages = [2, 3, 4]
+        later: List[str] = []
+        if kc:
+            cur_idx = self.graph.index_by_kc.get(kc.id, 0)
+            for p in found:
+                for kid in self.graph.kc_ids():
+                    if p in self.graph.kc_pages(self.graph.nodes[kid]) and self.graph.index_by_kc.get(kid, 0) > cur_idx:
+                        later.append(self.graph.nodes[kid].title)
+        _progress("Je cherche dans le mémento", "search")
+        prompt = (
+            f"Question de l'apprenant : {question}\n\n"
+            + (f"Notion en cours : « {kc.title} ».\n" if kc else "Aucune notion en cours (parcours pas encore commencé).\n")
+            + (f"Leçon en cours :\n{sess.current_micro_lesson[:1500]}\n\n" if sess.current_micro_lesson else "")
+            + f"Extraits du mémento (pages {sorted(set(pages))}) :\n{self.doc.pages_text(pages, max_chars=8000)}\n\n"
+            "Réponds en français, de façon concise et pédagogique, uniquement à partir des extraits, en citant la ou les pages. "
+            "Si la réponse n'est pas dans le mémento, dis-le clairement et propose la page la plus proche."
         )
+        answer = await run_text("Learner-question", INSTR_QA, prompt, ctx)
+        if later and kc:
+            answer += f"\n\nCe point est détaillé plus loin dans le parcours (notion « {later[0]} ») ; vous y reviendrez avec un quiz."
         sess.last_tutor_action = "answer_lesson_question"
-        self._record_event(sess, ctx, {
-            "event": "learner_question_answered",
-            "tutor_action": sess.last_tutor_action,
-            "question": question,
-            "current_kc_id": current_kc.id,
-            "current_kc_title": current_kc.title,
-            "allowed_kc_ids": [kc.id for kc in allowed_kcs],
-            "future_kc_ids": [kc.id for kc in future_kcs],
-            "source_pages": sorted({p for kc in allowed_kcs for p in self._kc_ref_pages(kc)}),
-            "answer_preview": answer[:1000],
-        })
-        return answer
+        self._record_event(sess, ctx, {"event": "learner_question_answered", "tutor_action": sess.last_tutor_action, "question": question, "current_kc_id": kc.id if kc else None, "source_pages": sorted(set(pages)), "answer_preview": answer[:1000]})
+        return [self._text(answer), self._actions(self._next_actions(sess))]
 
-    async def _answer_visual_question(
-        self,
-        sess: Session,
-        question: str,
-        image_urls: List[str],
-        ctx: AgentContext,
-    ) -> Any:
+    async def _answer_visual_question(self, sess: Session, question: str, image_urls: List[str], ctx: Any) -> List[Dict[str, Any]]:
+        self._charge_budget(sess)
         is_followup = False
         if image_urls:
             sess.last_visual_image_urls = list(image_urls)
@@ -1985,998 +1444,54 @@ Details:
         else:
             image_urls = list(sess.last_visual_image_urls)
             is_followup = True
-
         if not image_urls:
-            return "Ajoute d'abord une image de symbole, puis pose ta question."
-
-        current_kc = self.graph.nodes.get(sess.current_kc_id or "")
-        course_kcs = [
-            self.graph.nodes[kid]
-            for kid in self.graph.kc_ids()
-            if kid in self.graph.nodes
-        ]
-        answer = await self.visual_question.answer(
-            question=question,
-            image_urls=image_urls,
-            current_kc=current_kc,
-            course_kcs=course_kcs,
-            current_micro_lesson=sess.current_micro_lesson,
-            visual_context=sess.visual_question_history,
-            ctx=ctx,
+            return [self._text("Envoyez d'abord la photo d'un symbole, puis posez votre question.")]
+        kc = self._kc(sess.current_kc_id)
+        pages = [3, 4, 5] + self.doc.search_pages(question or "symbole forme couleur", k=3)
+        _progress("J'analyse la photo", "images")
+        prompt = (
+            f"L'apprenant envoie une photo de symbole et demande : {question or 'Que signifie ce symbole ?'}\n"
+            + (f"Notion en cours : « {kc.title} ».\n" if kc else "")
+            + (f"Échanges récents sur la même image : {sess.visual_question_history[-4:]}\n" if is_followup and sess.visual_question_history else "")
+            + f"\nExtraits du mémento (variables visuelles et pages voisines) :\n{self.doc.pages_text(pages, max_chars=9000)}\n\n"
+            "Réponds en français avec ce plan : 1) Je vois (forme, couleur, contour, texte, pictogramme) ; 2) Signification selon le mémento, élément par élément ; "
+            "3) Interprétation combinée ; 4) Source (pages). Si la photo est floue ou le symbole absent du mémento, dis-le et demande une photo plus nette."
         )
-        sess.visual_question_history.append({
-            "question": question or "Que signifie ce symbole ?",
-            "answer": answer[:1200],
-        })
-        sess.visual_question_history = sess.visual_question_history[-8:]
+        content: List[dict] = [{"type": "input_text", "text": prompt}]
+        for url in image_urls:
+            content.append({"type": "input_image", "image_url": url, "detail": "auto"})
+        answer = await run_text("Visual-symbol", INSTR_VISUAL, [{"role": "user", "content": content}], ctx, vision=True)
+        sess.visual_question_history = (sess.visual_question_history + [{"question": question or "Que signifie ce symbole ?", "answer": answer[:1200]}])[-8:]
         sess.last_tutor_action = "answer_visual_pdf_question"
-        self._record_event(sess, ctx, {
-            "event": "visual_question_answered",
-            "tutor_action": sess.last_tutor_action,
-            "question": question or "What does this symbol mean?",
-            "n_images": len(image_urls),
-            "image_context_reused": is_followup,
-            "scope": "full_pdf_course",
-            "current_kc_id": current_kc.id if current_kc else None,
-            "current_kc_title": current_kc.title if current_kc else None,
-            "course_kc_ids": [kc.id for kc in course_kcs],
-            "source_pages": sorted({p for kc in course_kcs for p in self._kc_ref_pages(kc)}),
-            "answer_preview": answer[:1000],
-        })
-        return answer
-
-    async def _build_adaptive_micro_lesson(
-        self,
-        sess: Session,
-        kc: KCNode,
-        ctx: AgentContext,
-        mistakes_summary: str = "",
-    ) -> str:
-        mastery_value = sess.mastery.get(kc.id)
-        diagnostic_level = sess.diagnostic_profile.get(kc.id)
-        learner_level = float(mastery_value if mastery_value is not None else (diagnostic_level or 0.0))
-        attempts = int(sess.attempts_by_kc.get(kc.id, 0))
-        labels = list(sess.misconceptions.get(kc.id, []))
-        summary = mistakes_summary or sess.last_mistakes_summary
-        lesson, lesson_plan = await self.micro_lesson.build(
-            kc=kc,
-            ctx=ctx,
-            mastery=learner_level,
-            attempts=attempts,
-            mistakes_summary=summary,
-            misconception_labels=labels,
-        )
-        self._record_event(sess, ctx, {
-            "event": "micro_lesson_generated",
-            "kc_id": kc.id,
-            "kc_title": kc.title,
-            "mastery": mastery_value,
-            "diagnostic_level": diagnostic_level,
-            "learner_level_for_adaptation": learner_level,
-            "attempts": attempts,
-            "misconceptions": labels,
-            "source_pages": self._kc_ref_pages(kc),
-            "word_estimate": len(lesson.split()),
-            "lesson_plan": lesson_plan,
-            "lesson_budget_words": lesson_plan.get("max_words"),
-            "lesson_complexity": lesson_plan.get("lesson_complexity"),
-            "lesson_mode": lesson_plan.get("lesson_mode"),
-            "lesson_preview": lesson[:1200],
-        })
-        return lesson
-
-
-    async def _next_kc_micro_lesson(self, sess: Session, ctx: AgentContext) -> Any:
-        # must have a current KC
-        if not sess.current_kc_id:
-            return "⚠️ No current KC. Type: start diagnostic"
-
-        # ✅ Gate check: only after passing practice for this KC
-        if not sess.can_advance or sess.validated_kc_id != sess.current_kc_id:
-            return (
-                "⚠️ You can type `next` only after validating the current KC.\n"
-                "Type: practice"
-            )
-        # ✅ New: module gate check
-        if sess.module_gate_locked:
-            mod_title = "Module"
-            if sess.pending_module_id and sess.pending_module_id in self.graph.nodes:
-                mod_title = self.graph.nodes[sess.pending_module_id].title
-            return (
-                f"⚠️ You must pass the module checkpoint quiz for: {mod_title}\n"
-                f"Submit the module quiz (if shown), or type: practice to remediate."
-            )
-
-        nxt = sess.pending_next_kc_id or self.graph.next_kc(sess.current_kc_id)
-        if not nxt or nxt not in self.graph.nodes:
-            sess.can_advance = False
-            sess.validated_kc_id = None
-            sess.pending_next_kc_id = None
-            return "🏁 No next KC. You finished the course sequence."
-
-        sess.current_kc_id = nxt
-        sess.pending_next_kc_id = None
-        sess.scope = "practice"
-        sess.phase = "idle"
-
-        # reset adaptation memory
-        sess.last_mistakes_summary = ""
-        sess.current_micro_lesson = ""
-
-        # ✅ Lock gate again until next KC is passed
-        sess.can_advance = False
-        sess.validated_kc_id = None
-        sess.pending_next_kc_id = None
-        
-        kc = self.graph.nodes[nxt]
-        lesson_text = await self._build_adaptive_micro_lesson(sess, kc, ctx)
-        sess.current_micro_lesson = lesson_text
-
-        text = (
-            f"📘 Next KC: {kc.title}\n\n"
-            f"{lesson_text}\n\n"
-            f"➡️ Type: practice"
-        )
-        return self._build_lesson_with_refs(kc, text)
-    
-    async def _show_radar(self, sess: Session) -> dict:
-        groups = self.graph.container_groups_for_radar()
-        container_ids = self.graph.container_ids_in_order()
-
-        views = {}
-
-        # View 1: Containers radar (container score = avg KC mastery)
-        labels, vals = [], []
-        for cid in container_ids:
-            kc_ids = groups.get(cid, [])
-            if cid == "ROOT":
-                title = "ROOT"
-            else:
-                title = self.graph.nodes[cid].title if cid in self.graph.nodes else cid
-
-            m = [float(sess.mastery.get(k, 0.0)) for k in kc_ids]
-            score = (sum(m) / max(1, len(m))) if m else 0.0
-
-            labels.append(title)
-            vals.append(score)
-
-        views["modules"] = {"label": "Sections", "labels": labels, "values": vals}
-
-        # View per container: its KCs
-        for cid in container_ids:
-            kc_ids = groups.get(cid, [])
-            title = "ROOT" if cid == "ROOT" else (self.graph.nodes[cid].title if cid in self.graph.nodes else cid)
-
-            kc_labels, kc_vals = [], []
-            for kid in kc_ids:
-                n = self.graph.nodes.get(kid)
-                if not n:
-                    continue
-                kc_labels.append(n.title)
-                kc_vals.append(float(sess.mastery.get(kid, 0.0)))
-
-            views[f"sec::{cid}"] = {
-                "label": f"KCs: {title}",
-                "labels": kc_labels,
-                "values": kc_vals,
-            }
-
-        html = build_radar_dashboard_html("Radar — Sections & KCs", views, default_view="modules")
-
-        return {
-            "type": "radar",
-            "data": {"name": "Radar — Sections & KCs", "buttonLabel": "Open radar", "html": html},
-        }
-
-
-
-
-
-
-    def _help_text(self) -> str:
-        return (
-            "Guide rapide de l'ITS\n\n"
-            "Parcours conseille:\n"
-            "1. Tape `start diagnostic` pour commencer l'estimation de niveau.\n"
-            "2. Reponds au QCM diagnostic. Il sert seulement a estimer ton niveau, pas a valider les KCs.\n"
-            "3. Lis la micro-lecon proposee pour la KC faible.\n"
-            "4. Pose une question si quelque chose n'est pas clair.\n"
-            "5. Tape `practice` pour lancer un QCM adapte a la KC.\n"
-            "6. Si tu fais des erreurs, lis le feedback puis tape `hint` pour recevoir une aide progressive.\n"
-            "7. Refais `practice` jusqu'a validation.\n"
-            "8. Apres validation, tape `next` pour passer a la KC suivante.\n"
-            "9. Tape `radar` pour voir ta progression.\n\n"
-            "Commandes:\n"
-            "- `start diagnostic`: demarrer le diagnostic global.\n"
-            "- `practice`: generer un QCM adapte a la KC actuelle.\n"
-            "- `hint`: obtenir l'indice suivant apres une erreur.\n"
-            "- `next`: passer a la KC suivante apres validation.\n"
-            "- `radar`: afficher la progression par KC/module.\n"
-            "- `clear image`: oublier l'image active.\n\n"
-            "Questions et images:\n"
-            "- Pendant une micro-lecon, tu peux poser des questions texte sur la KC actuelle et les KCs precedentes.\n"
-            "- Tu peux uploader une image de symbole et demander sa signification.\n"
-            "- Les questions suivantes reutilisent la meme image jusqu'a `clear image`."
-        )
-
-    # =====================================================
-    # MAIN ENTRY (called by chatkit_server.respond)
-    # =====================================================
-    async def handle(self, user_input: Any, ctx: AgentContext) -> Any:
-        text = extract_latest_user_text(user_input).strip()
-        image_urls = extract_latest_user_image_urls(user_input)
-        low = text.lower()
-
-        sess = self._get_sess(ctx)
-        request_context = getattr(ctx, "request_context", None) or {}
-        provider = request_context.get("provider")
-        current_provider.set(ProviderChoice(
-            provider=provider if provider in KNOWN_PROVIDERS else DEFAULT_PROVIDER,
-            api_key=request_context.get("api_key") or None,
-        ))
-
-        if image_urls:
-            return await self._answer_visual_question(sess, text, image_urls, ctx)
-        if low in {"clear image", "forget image", "new image"}:
-            sess.last_visual_image_urls = []
-            sess.visual_question_history = []
-            return "Image oubliee. Ajoute une nouvelle image pour une autre analyse visuelle."
-        if low in {"help", "guide", "aide", "commands", "commandes"}:
-            return self._help_text()
-
-        # ---- start diagnostic
-        if low in START_DIAGNOSTIC_TRIGGERS:
-            return await self._start_diagnostic(sess, ctx)
-
-        # ---- practice on current weakness
-        if low in PRACTICE_TRIGGERS:
-            if not sess.current_kc_id:
-                return "⚠️ No weakness KC selected yet. Type: start diagnostic"
-            return await self._start_practice(sess, ctx)
-        # ---- go to next KC and show micro-lesson
-        if low in NEXT_KC_TRIGGERS:
-            if not sess.current_kc_id:
-                return "⚠️ No current KC. Type: start diagnostic"
-            return await self._next_kc_micro_lesson(sess, ctx)
-        # ---- if user typed answers in chat (optional path)
-        if low in {"checkpoint", "retry", "module quiz"}:
-            if not sess.pending_module_id:
-                return "⚠️ No module checkpoint pending."
-            if not sess.pending_module_retry:
-                return "⚠️ No retry requested. Submit the module quiz first."
-            sess.pending_module_retry = False
-            return await self._start_module_quiz(sess, sess.pending_module_id, ctx)
-        if low in {"radar", "show radar", "evaluation radar"}:
-            return await self._show_radar(sess)
-        if low in {"hint", "next hint"}:
-            return self._next_hint_text(sess)
-        if low in {"debug its", "its debug", "show its state"}:
-            lines = [
-                f"scope={sess.scope}",
-                f"phase={sess.phase}",
-                f"current_kc_id={sess.current_kc_id}",
-                f"last_tutor_action={sess.last_tutor_action or '(none)'}",
-            ]
-            if sess.current_kc_id:
-                lines.append(f"attempts={sess.attempts_by_kc.get(sess.current_kc_id, 0)}")
-                lines.append(f"misconceptions={sess.misconceptions.get(sess.current_kc_id, [])}")
-            lines.append(f"evidence_events={len(sess.evidence_events)}")
-            return "\n".join(lines)
-        if low in {"debug mastery", "mastery debug", "show mastery"}:
-            lines = [
-                f"scope={sess.scope}",
-                f"phase={sess.phase}",
-                f"current_kc_id={sess.current_kc_id}",
-            ]
-            if not sess.mastery:
-                lines.append("mastery=(empty)")
-            else:
-                for kid, val in sorted(sess.mastery.items()):
-                    title = self.graph.nodes[kid].title if kid in self.graph.nodes else kid
-                    last = sess.last_score_by_kc.get(kid, 0.0)
-                    lines.append(f"{kid} | {title} | mastery={val:.3f} | latest={last:.3f}")
-            if sess.diagnostic_profile:
-                lines.append("diagnostic_profile=(screening only)")
-                for kid, val in sorted(sess.diagnostic_profile.items()):
-                    title = self.graph.nodes[kid].title if kid in self.graph.nodes else kid
-                    raw = sess.diagnostic_raw_score_by_kc.get(kid, 0.0)
-                    lines.append(f"{kid} | {title} | profile={val:.3f} | raw={raw:.3f}")
-            return "\n".join(lines)
-
-
-        if looks_like_answers(text):
-            answers = parse_answers_from_text(text)
-            return await self._process_answers(sess, answers, ctx)
-
-        if sess.last_visual_image_urls and sess.last_tutor_action == "answer_visual_pdf_question":
-            return await self._answer_visual_question(sess, text, [], ctx)
-
-        if sess.current_kc_id and sess.phase != "waiting_answers":
-            return await self._answer_learner_question(sess, text, ctx)
-
-        # ---- default help
-        return self._help_text()
-
-    def peek_transition_message(self, ctx: AgentContext, raw_text: str) -> Optional[str]:
-        """
-        Read-only precondition check mirroring the guards inside handle()'s
-        dispatch, so the caller can announce a wait ONLY when the matching
-        slow (LLM-backed) branch will actually run. Never mutates session
-        state or triggers generation itself.
-        """
-        low = (raw_text or "").strip().lower()
-        sess = self._get_sess(ctx)
-
-        if low in START_DIAGNOSTIC_TRIGGERS:
-            return "🎯 Je prépare un diagnostic de 8 questions pour estimer votre niveau. Un instant..."
-
-        if low in PRACTICE_TRIGGERS:
-            if not sess.current_kc_id:
-                return None
-            return "📝 Je prépare un quiz adapté à cette notion. Un instant..."
-
-        if low in NEXT_KC_TRIGGERS:
-            if not sess.current_kc_id:
-                return None
-            if not sess.can_advance or sess.validated_kc_id != sess.current_kc_id:
-                return None
-            if sess.module_gate_locked:
-                return None
-            return "📘 Je prépare la leçon suivante. Un instant..."
-
-        return None
-
-    # =====================================================
-    # INTERNAL STEPS
-    # =====================================================
-    async def _start_diagnostic(self, sess: Session, ctx: AgentContext) -> Any:
-        kcs = self._kc_nodes_for_diagnostic()
-        if not kcs:
-            return "⚠️ No KCs found in kc_graph1.json."
-
-        questions = await self.diagnostic_qcm.generate(kcs, DIAGNOSTIC_Q_NUM, ctx)
-
-        # build hidden answers + mapping
-        hidden: Dict[int, str] = {}
-        q_to_kc: Dict[int, str] = {}
-        q_text: Dict[int, dict] = {}
-
-        for q in questions:
-            num = int(q["number"])
-            hidden[num] = str(q["answer"]).upper().strip()
-            kc_id = str(q.get("kc_id") or "").strip()
-            if kc_id not in self.graph.nodes:
-                kc_id = kcs[0].id  # fallback
-            q_to_kc[num] = kc_id
-
-            q_text[num] = {"text": q["text"], "choices": q["choices"]}
-
-        sess.scope = "diagnostic"
-        sess.phase = "waiting_answers"
-        sess.last_hidden_answers = hidden
-        sess.last_question_to_kc = q_to_kc
-        sess.last_question_text = q_text
-        sess.last_tutor_action = "start_diagnostic"
-        sess.pending_hint_ladder = []
-        sess.hint_index = 0
-
-        # server compatibility
-        self.hidden_answers = hidden
-        print(self.hidden_answers)
-        self._record_event(sess, ctx, {
-            "event": "diagnostic_started",
-            "tutor_action": sess.last_tutor_action,
-            "n_questions": len(questions),
-            "kc_ids": [k.id for k in kcs],
-        })
-        data = qcm_widget_data(
-            title=f"Global Diagnostic QCM — {self.graph.title}",
-            questions=questions,
-        )
-        return {"type": "qcm", "data": data}
-
-    async def _start_practice(self, sess: Session, ctx: AgentContext) -> Any:
-        kc = self.graph.nodes.get(sess.current_kc_id or "")
-        # ✅ RESET gate at the start of each practice attempt
-        sess.can_advance = False
-        sess.validated_kc_id = None
-        if not kc:
-            return "⚠️ Current KC not found."
-
-
-        # Ensure we have a micro-lesson for this KC (Option B needs it)
-        if not sess.current_micro_lesson.strip():
-            sess.current_micro_lesson = await self._build_adaptive_micro_lesson(sess, kc, ctx)
-            sess.last_mistakes_summary = ""
-
-        micro = sess.current_micro_lesson.strip()
-        mistakes = sess.last_mistakes_summary.strip() or "(No mistakes yet; first practice attempt.)"
-        mastery = float(sess.mastery.get(kc.id, 0.0))
-        attempts_before = int(sess.attempts_by_kc.get(kc.id, 0))
-        difficulty = self.policy.select_difficulty(mastery, attempts_before)
-        review_kc_ids = self.graph.previous_kcs(kc.id, limit=2)
-        review_kcs = [self.graph.nodes[i] for i in review_kc_ids if i in self.graph.nodes]
-        lesson_targets = extract_lesson_essentials(micro)
-        kc_targets = sess.kc_essential_targets.get(kc.id)
-        if kc_targets is None:
-            kc_targets = await self.kc_targets.extract(kc, micro, ctx)
-            sess.kc_essential_targets[kc.id] = kc_targets
-
-        essential_targets = merge_essential_targets(
-            kc_targets=kc_targets,
-            lesson_targets=lesson_targets,
-            limit=PRACTICE_MAX_Q,
-        )
-        if not essential_targets:
-            essential_targets = lesson_targets or [kc.title]
-
-        essential_count = len(essential_targets)
-        min_q, max_q = estimate_practice_bounds_from_targets(
-            essential_targets=essential_targets,
-            mistakes_summary=mistakes,
-            base_min=PRACTICE_MIN_Q,
-            base_max=PRACTICE_MAX_Q,
-            review_kc_count=len(review_kcs),
-            attempts=attempts_before,
-            difficulty=difficulty,
-        )
-
-        pack = await self.practice_qcm.generate_adaptive(
-            kc,
-            review_kcs,
-            micro,
-            mistakes,
-            difficulty,
-            min_q,
-            max_q,
-            essential_count,
-            essential_targets,
-            ctx,
-        )
-        n, questions = normalize_adaptive_practice_pack(pack, min_q, max_q)
-        coverage_plan = pack.get("coverage_plan", []) if isinstance(pack, dict) else []
-        missing_targets = missing_coverage_target_ids(essential_targets, coverage_plan)
-
-        if missing_targets:
-            try:
-                repaired_pack = await self.practice_qcm.repair_coverage(
-                    kc=kc,
-                    review_kcs=review_kcs,
-                    existing_pack=pack if isinstance(pack, dict) else {},
-                    essential_targets=essential_targets,
-                    missing_target_ids=missing_targets,
-                    difficulty=difficulty,
-                    min_questions=min_q,
-                    max_questions=max_q,
-                    ctx=ctx,
-                )
-                repaired_missing = missing_coverage_target_ids(
-                    essential_targets,
-                    repaired_pack.get("coverage_plan", []) if isinstance(repaired_pack, dict) else [],
-                )
-                if len(repaired_missing) <= len(missing_targets):
-                    pack = repaired_pack
-                    n, questions = normalize_adaptive_practice_pack(pack, min_q, max_q)
-                    coverage_plan = pack.get("coverage_plan", []) if isinstance(pack, dict) else []
-                    missing_targets = repaired_missing
-            except Exception:
-                pass
-
-        # Validate questions shape
-        def _is_valid_q(q: dict) -> bool:
-            return (
-                isinstance(q, dict)
-                and isinstance(q.get("text"), str)
-                and isinstance(q.get("choices"), list)
-                and len(q["choices"]) == 4
-                and str(q.get("answer", "")).upper() in {"A", "B", "C", "D"}
-            )
-
-        questions = [q for q in questions if _is_valid_q(q)]
-        n = len(questions)
-
-        # Hard fallback if model returned invalid JSON / invalid questions
-        if n == 0:
-            n = min_q
-            questions = [{
-                "number": i,
-                "text": "Fallback question (model output invalid).",
-                "choices": ["Option A", "Option B", "Option C", "Option D"],
-                "answer": "A",
-            } for i in range(1, n + 1)]
-
-        hidden: Dict[int, str] = {}
-        q_to_kc: Dict[int, str] = {}
-        q_text: Dict[int, dict] = {}
-
-        for q in questions:
-            num = int(q["number"])
-            hidden[num] = str(q["answer"]).upper().strip()
-            q_to_kc[num] = kc.id
-            q_text[num] = {
-                "text": q["text"],
-                "choices": q["choices"],
-                "target_id": q.get("target_id", ""),
-                "target": q.get("target", ""),
-                "integrates_kc_ids": q.get("integrates_kc_ids", []),
-            }
-
-        sess.scope = "practice"
-        sess.phase = "waiting_answers"
-        sess.last_hidden_answers = hidden
-        sess.last_question_to_kc = q_to_kc
-        sess.last_question_text = q_text
-        sess.attempts_by_kc[kc.id] = attempts_before + 1
-        sess.last_tutor_action = f"generate_{difficulty}_practice"
-        sess.pending_hint_ladder = []
-        sess.hint_index = 0
-
-        self.hidden_answers = hidden
-        print(self.hidden_answers)
-        self._record_event(sess, ctx, {
-            "event": "practice_started",
-            "tutor_action": sess.last_tutor_action,
-            "kc_id": kc.id,
-            "kc_title": kc.title,
-            "difficulty": difficulty,
-            "attempt": sess.attempts_by_kc[kc.id],
-            "mastery_before": mastery,
-            "n_questions": n,
-            "practice_min_questions": min_q,
-            "practice_max_questions": max_q,
-            "lesson_essential_count": essential_count,
-            "practice_length_strategy": {
-                "basis": "pdf_kc_targets + lesson_targets + previous_kc_integration + mistakes + attempts + difficulty",
-                "difficulty": difficulty,
-                "attempts_before": attempts_before,
-                "review_kc_count": len(review_kcs),
-                "mistake_count": len(re.findall(r"\bQ\d+:", mistakes)),
-                "kc_target_count": len(kc_targets),
-                "lesson_target_count": len(lesson_targets),
-            },
-            "kc_essential_targets": kc_targets,
-            "micro_lesson_essential_targets": lesson_targets,
-            "lesson_essential_targets": essential_targets,
-            "practice_essential_targets": essential_targets,
-            "missing_coverage_target_ids": missing_targets,
-            "coverage_plan": coverage_plan,
-            "review_kc_ids": [item.id for item in review_kcs],
-            "review_kc_titles": [item.title for item in review_kcs],
-            "source_pages": self._kc_ref_pages(kc),
-        })
-        data = qcm_widget_data(
-            title=f"Practice QCM — {kc.title} ({n} questions)",
-            questions=questions,
-        )
-        return {"type": "qcm", "data": data}
-    
-    async def _start_module_quiz(self, sess: Session, module_id: str, ctx: AgentContext) -> Any:
-        # build KC list for the module
-        module_kc_ids = self.graph.module_kcs(module_id)
-        module_kcs = [self.graph.nodes[i] for i in module_kc_ids if i in self.graph.nodes]
-
-        if not module_kcs:
-            # nothing to quiz -> unlock module and continue
-            sess.module_gate_locked = False
-            sess.pending_module_id = None
-            return "⚠️ Module has no KCs to quiz."
-
-        # choose number of questions (same heuristic)
-        n_module_q = max(MODULE_MIN_Q, min(MODULE_MAX_Q, max(8, len(module_kcs) * 2)))
-
-        questions = await self.module_qcm.generate(
-            module_title=self.graph.nodes[module_id].title if module_id in self.graph.nodes else "Module",
-            kc_list=module_kcs,
-            n_questions=n_module_q,
-            ctx=ctx,
-        )
-
-        # store quiz state
-        hidden: Dict[int, str] = {}
-        q_to_kc: Dict[int, str] = {}
-        q_text: Dict[int, dict] = {}
-
-        for q in questions:
-            num = int(q["number"])
-            hidden[num] = str(q["answer"]).upper().strip()
-            kc_id = str(q.get("kc_id") or "").strip()
-            if kc_id not in self.graph.nodes:
-                kc_id = module_kcs[0].id
-            q_to_kc[num] = kc_id
-            q_text[num] = {"text": q["text"], "choices": q["choices"]}
-
-        sess.scope = "module_quiz"
-        sess.phase = "waiting_answers"
-        sess.last_hidden_answers = hidden
-        sess.last_question_to_kc = q_to_kc
-        sess.last_question_text = q_text
-        sess.last_tutor_action = "start_module_checkpoint"
-        sess.pending_hint_ladder = []
-        sess.hint_index = 0
-
-        self.hidden_answers = hidden
-        print(self.hidden_answers)
-        self._record_event(sess, ctx, {
-            "event": "module_checkpoint_started",
-            "tutor_action": sess.last_tutor_action,
-            "module_id": module_id,
-            "module_title": self.graph.nodes[module_id].title if module_id in self.graph.nodes else "Module",
-            "kc_ids": [k.id for k in module_kcs],
-            "n_questions": len(questions),
-        })
-
-        data = qcm_widget_data(
-            title=f"✅ Module Checkpoint — {self.graph.nodes[module_id].title if module_id in self.graph.nodes else 'Module'}",
-            questions=questions,
-        )
-        return {"type": "qcm", "data": data}
-
-
-
-    async def _process_answers(self, sess: Session, answers: Dict[int, str], ctx: AgentContext) -> Any:
-        if sess.phase != "waiting_answers" or not sess.last_hidden_answers:
-            return "⚠️ No active QCM. Type: start diagnostic"
-
-        correct = sess.last_hidden_answers
-        q_to_kc = sess.last_question_to_kc
-        mastery_before = dict(sess.mastery)
-
-        weakness_kc_id, overall, per_kc = self.scorer.find_weakness(q_to_kc, answers, correct)
-        print(f"[_process_answers] scope={sess.scope} submitted={dict(answers)} correct={dict(correct)} overall={overall:.2f} per_kc={per_kc}")
-
-        # update mastery (EMA)
-        # update mastery (EMA) — FIXED (no 30% on first observation)
-        for kc_id, (c_cnt, t_cnt) in per_kc.items():
-            score = (c_cnt / t_cnt) if t_cnt else 1.0
-            sess.last_score_by_kc[kc_id] = score
-
-            if sess.scope == "diagnostic":
-                sess.diagnostic_raw_score_by_kc[kc_id] = score
-                sess.diagnostic_profile[kc_id] = diagnostic_screening_mastery(score)
-                continue
-
-            if sess.scope == "practice":
-                alpha = 0.8
-                evidence_score = score
-            else:
-                alpha = 0.4
-                evidence_score = score
-
-            if kc_id not in sess.mastery:
-                sess.mastery[kc_id] = evidence_score
-            else:
-                old = sess.mastery[kc_id]
-                sess.mastery[kc_id] = (1 - alpha) * old + alpha * evidence_score
-
-
-
-
-        # DIAGNOSTIC => pick weakness then micro-lesson
-        if sess.scope == "diagnostic":
-            if not weakness_kc_id:
-                return "✅ Diagnostic done, but I couldn't map weakness to a KC. Try practice."
-
-            sess.current_kc_id = weakness_kc_id
-            kc = self.graph.nodes.get(weakness_kc_id)
-            if not kc:
-                return "✅ Diagnostic done. Weakness KC missing in graph."
-
-            # produce micro-lesson
-            lesson_text = await self._build_adaptive_micro_lesson(sess, kc, ctx)
-            sess.current_micro_lesson = lesson_text
-            sess.last_mistakes_summary = ""
-            sess.last_tutor_action = "diagnose_weak_kc_then_micro_lesson"
-
-            sess.phase = "idle"
-            self.hidden_answers = None
-            self._record_event(sess, ctx, {
-                "event": "diagnostic_submitted",
-                "tutor_action": sess.last_tutor_action,
-                "evidence_role": "screening_only",
-                "mastery_interpretation": "Diagnostic estimates candidate weakness; it does not validate full KC mastery.",
-                "diagnostic_mastery_cap": {
-                    "min": DIAGNOSTIC_MIN_MASTERY,
-                    "max": DIAGNOSTIC_MAX_MASTERY,
-                },
-                "overall_score": overall,
-                "weakness_kc_id": weakness_kc_id,
-                "weakness_kc_title": kc.title,
-                "per_kc": per_kc,
-                "diagnostic_raw_score_by_kc": dict(sess.diagnostic_raw_score_by_kc),
-                "diagnostic_profile": dict(sess.diagnostic_profile),
-                "mastery_before": mastery_before,
-                "mastery_after": dict(sess.mastery),
-                "mastery_update": "none_from_diagnostic",
-                "source_pages": self._kc_ref_pages(kc),
-            })
-
-            screening_text = (
-                "Diagnostic screening result: this quiz identifies a candidate weak KC; "
-                "it does not prove full mastery of other KCs and does not validate/pass any KC.\n"
-                "I will use it only to adapt the next lesson level.\n\n"
-                f"Candidate weak KC: {kc.title}\n\n"
-                f"{lesson_text}"
-            )
-            return self._build_lesson_with_refs(kc, screening_text)
-        
-        if sess.scope == "module_quiz":
-            module_id = sess.pending_module_id
-            module_score = overall
-
-            wrong_items = self._build_wrong_items(sess, answers, correct)
-            decision = self.policy.module_result(module_score)
-            sess.last_tutor_action = decision.action
-
-            # Always clear quiz buffers after submission (prevents stale state bugs)
-            self._clear_quiz_state(sess)
-            sess.phase = "idle"
-
-            if module_id:
-                sess.module_mastery[module_id] = module_score
-
-            # ---------- FAIL: explain + regenerate module quiz ----------
-            if module_score < MODULE_THRESHOLD:
-                sess.module_gate_locked = True
-                sess.pending_module_retry = True
-
-                module_title = self.graph.nodes[module_id].title if (module_id and module_id in self.graph.nodes) else "Module"
-                dummy_module_node = KCNode(id=module_id or "module", title=module_title, kind="module")
-
-                expl = await self.explain_mistake.explain(dummy_module_node, wrong_items, ctx)
-                sess.last_module_feedback = expl  # optional
-
-                # clear QCM state
-                sess.last_hidden_answers = {}
-                sess.last_question_to_kc = {}
-                sess.last_question_text = {}
-                self.hidden_answers = None
-                sess.scope = "idle"
-                sess.phase = "idle"
-                self._record_event(sess, ctx, {
-                    "event": "module_checkpoint_submitted",
-                    "tutor_action": decision.action,
-                    "decision_reason": decision.reason,
-                    "module_id": module_id,
-                    "score": module_score,
-                    "threshold": MODULE_THRESHOLD,
-                    "wrong_items": wrong_items,
-                    "mastery_before": mastery_before,
-                    "mastery_after": dict(sess.mastery),
-                })
-
-                return (
-                    f"{expl}\n\n"
-                    f"❌ Module not validated (score={module_score:.0%}, need {MODULE_THRESHOLD:.0%}).\n"
-                    f"➡️ Type: checkpoint  (or retry) to generate a new module quiz."
-                )
-
-
-            # ---------- PASS: unlock + auto-move to next KC ----------
-            sess.module_gate_locked = False
-            sess.pending_module_id = None
-
-            nxt = sess.pending_next_kc_id
-            self._record_event(sess, ctx, {
-                "event": "module_checkpoint_submitted",
-                "tutor_action": decision.action,
-                "decision_reason": decision.reason,
-                "module_id": module_id,
-                "score": module_score,
-                "threshold": MODULE_THRESHOLD,
-                "wrong_items": wrong_items,
-                "mastery_before": mastery_before,
-                "mastery_after": dict(sess.mastery),
-                "next_kc_id": nxt,
-            })
-            if not nxt or nxt not in self.graph.nodes:
-                return f"✅ Module validated (score={module_score:.0%}). 🏁 End of course."
-
-            # Move to next KC automatically
-            sess.current_kc_id = nxt
-            sess.scope = "practice"
-            sess.phase = "idle"
-
-            # reset per-KC adaptation + lock gate until KC practice passes
-            sess.can_advance = False
-            sess.validated_kc_id = None
-            sess.pending_next_kc_id = None
-            sess.last_mistakes_summary = ""
-            sess.current_micro_lesson = ""
-
-            kc = self.graph.nodes[nxt]
-            lesson_text = await self._build_adaptive_micro_lesson(sess, kc, ctx)
-            sess.current_micro_lesson = lesson_text
-
-            text = (
-                f"✅ Module validated (score={module_score:.0%}).\n"
-                f"📘 Next KC: {kc.title}\n\n"
-                f"{lesson_text}\n\n"
-                f"➡️ Type: practice"
-            )
-            return self._build_lesson_with_refs(kc, text)
-
-
-
-
-        # PRACTICE => pass/fail loop
-        if sess.scope == "practice":
-            kc_id = sess.current_kc_id
-            kc = self.graph.nodes.get(kc_id or "") if kc_id else None
-            if not kc:
-                return "⚠️ Practice evaluated, but current KC missing."
-
-            # determine score on this KC
-            c_cnt, t_cnt = per_kc.get(kc.id, (0, len(correct)))
-            practice_score = (c_cnt / max(1, t_cnt))
-            # ✅ PASS => unlock "next" for THIS KC only
-
-            if practice_score < THRESHOLD:
-                # ✅ FAIL => keep next locked
-                sess.can_advance = False
-                sess.validated_kc_id = None
-
-                wrong_items = self._build_wrong_items(sess, answers, correct)
-                misconceptions = self.misconception_tracker.detect(kc, wrong_items)
-                self._store_misconceptions(sess, misconceptions)
-                decision = self.policy.practice_result(
-                    score=practice_score,
-                    mastery=float(sess.mastery.get(kc.id, 0.0)),
-                    attempts=int(sess.attempts_by_kc.get(kc.id, 0)),
-                    misconceptions=misconceptions,
-                )
-                sess.last_tutor_action = decision.action
-                sess.pending_hint_ladder = self._build_hint_ladder(kc, misconceptions, wrong_items)
-                sess.hint_index = 0
-
-                latest_mistake_lines = []
-                for wi in wrong_items[:8]:
-                    q_short = (wi.get("question", "") or "")[:180]
-                    latest_mistake_lines.append(
-                        f"Q{wi['number']}: learner={wi.get('learner_letter','?')} "
-                        f"correct={wi.get('correct_letter','?')} | {q_short}"
-                    )
-                latest_mistakes_summary = "\n".join(latest_mistake_lines)
-
-                expl = await self.explain_mistake.explain(kc, wrong_items, ctx)
-                lesson_text = await self._build_adaptive_micro_lesson(
-                    sess,
-                    kc,
-                    ctx,
-                    mistakes_summary=latest_mistakes_summary,
-                )
-
-                # ✅ store lesson + mistakes for adaptive practice
-                sess.current_micro_lesson = lesson_text
-
-                lines = []
-                for wi in wrong_items[:8]:
-                    q_short = (wi.get("question", "") or "")[:180]
-                    lines.append(f"Q{wi['number']}: learner={wi.get('learner_letter','?')} correct={wi.get('correct_letter','?')} | {q_short}")
-                sess.last_mistakes_summary = "\n".join(lines)
-
-
-                sess.phase = "idle"
-                self._clear_quiz_state(sess)
-                self._record_event(sess, ctx, {
-                    "event": "practice_submitted",
-                    "tutor_action": decision.action,
-                    "decision_reason": decision.reason,
-                    "kc_id": kc.id,
-                    "kc_title": kc.title,
-                    "score": practice_score,
-                    "threshold": THRESHOLD,
-                    "passed": False,
-                    "wrong_items": wrong_items,
-                    "misconceptions": [obs.label for obs in misconceptions],
-                    "mastery_before": mastery_before,
-                    "mastery_after": dict(sess.mastery),
-                    "attempt": sess.attempts_by_kc.get(kc.id, 0),
-                    "source_pages": self._kc_ref_pages(kc),
-                })
-                hint_text = self._next_hint_text(sess)
-
-                text = (
-                    f"KC non validee: {kc.title}\n"
-                    f"Score: {practice_score:.0%} (seuil: {THRESHOLD:.0%})\n\n"
-                    f"{hint_text}\n\n"
-                    f"{expl}"
-                )
-                return self._build_lesson_with_refs(kc, text)
-
-
-
-
-            # ✅ PASS => unlock next for THIS KC
-            sess.can_advance = True
-            sess.validated_kc_id = kc.id
-            decision = self.policy.practice_result(
-                score=practice_score,
-                mastery=float(sess.mastery.get(kc.id, 0.0)),
-                attempts=int(sess.attempts_by_kc.get(kc.id, 0)),
-                misconceptions=[],
-            )
-            sess.last_tutor_action = decision.action
-            sess.pending_hint_ladder = []
-            sess.hint_index = 0
-
-            # store pending next (do NOT move now)
-            nxt = self.graph.next_kc(kc.id)
-            sess.pending_next_kc_id = nxt if (nxt and nxt in self.graph.nodes) else None
-            cur_module = self.graph.module_of(kc.id)
-            next_module = self.graph.module_of(nxt) if nxt else None
-            sess.current_module_id = cur_module
-
-            # if end-of-module (next KC is in another module OR no next KC)
-            if cur_module and (not nxt or next_module != cur_module):
-                sess.pending_module_id = cur_module
-                sess.module_gate_locked = True
-                sess.pending_module_retry = False
-                self._record_event(sess, ctx, {
-                    "event": "practice_submitted",
-                    "tutor_action": "validate_kc_then_module_checkpoint",
-                    "decision_reason": "KC validated and the next KC is outside the current module.",
-                    "kc_id": kc.id,
-                    "kc_title": kc.title,
-                    "score": practice_score,
-                    "threshold": THRESHOLD,
-                    "passed": True,
-                    "mastery_before": mastery_before,
-                    "mastery_after": dict(sess.mastery),
-                    "attempt": sess.attempts_by_kc.get(kc.id, 0),
-                    "source_pages": self._kc_ref_pages(kc),
-                    "module_id": cur_module,
-                })
-                return await self._start_module_quiz(sess, cur_module, ctx)
-
-                
-            # clear quiz state (keep current_kc_id as the validated KC!)
-            sess.phase = "idle"
-            self._clear_quiz_state(sess)
-            self._record_event(sess, ctx, {
-                "event": "practice_submitted",
-                "tutor_action": decision.action,
-                "decision_reason": decision.reason,
-                "kc_id": kc.id,
-                "kc_title": kc.title,
-                "score": practice_score,
-                "threshold": THRESHOLD,
-                "passed": True,
-                "mastery_before": mastery_before,
-                "mastery_after": dict(sess.mastery),
-                "attempt": sess.attempts_by_kc.get(kc.id, 0),
-                "source_pages": self._kc_ref_pages(kc),
-                "next_kc_id": sess.pending_next_kc_id,
-            })
-
-            if sess.pending_next_kc_id:
-                next_kc = self.graph.nodes[sess.pending_next_kc_id]
-                return (
-                    f"✅ Validated KC: {kc.title} (score={practice_score:.0%}).\n"
-                    f"➡️ Next KC: {next_kc.title}\n"
-                    f"Type: next"
-                )
-
-            return (
-                f"✅ Validated KC: {kc.title} (score={practice_score:.0%}).\n"
-                f"🏁 No next KC. You finished the course sequence."
-            )
-
-
-
-        sess.phase = "idle"
-        self.hidden_answers = None
-        return "✅ Done."
-
-    # =====================================================
-    # OPTIONAL: hook for your server's qcm.submit action
-    # If you later update chatkit_server.py, call this.
-    # =====================================================
-    async def handle_qcm_submit(self, submitted_answers: Dict[int, str], ctx: AgentContext) -> Any:
-        sess = self._get_sess(ctx)
-        request_context = getattr(ctx, "request_context", None) or {}
-        provider = request_context.get("provider")
-        current_provider.set(ProviderChoice(
-            provider=provider if provider in KNOWN_PROVIDERS else DEFAULT_PROVIDER,
-            api_key=request_context.get("api_key") or None,
-        ))
-        return await self._process_answers(sess, submitted_answers, ctx)
+        self._record_event(sess, ctx, {"event": "visual_question_answered", "tutor_action": sess.last_tutor_action, "question": question, "n_images": len(image_urls), "image_context_reused": is_followup, "scope": "full_pdf_course", "current_kc_id": kc.id if kc else None, "source_pages": sorted(set(pages)), "answer_preview": answer[:1000]})
+        return [self._text(answer), self._actions([("Oublier la photo", "oublier la photo")] + self._next_actions(sess))]
+
+
+# =====================================================
+# INSTRUCTIONS (system prompts)
+# =====================================================
+INSTR_QCM = (
+    "Tu es formateur de sapeurs-pompiers. Tu rédiges des questions à choix multiples en français, uniquement à partir de l'extrait du mémento fourni "
+    "dans le message. Chaque question a exactement 4 propositions distinctes et une seule bonne réponse, désignée par sa lettre. "
+    "Les distracteurs sont plausibles (autres symboles, couleurs ou règles du mémento), jamais absurdes. La justification cite la page. "
+    "Conserve les termes officiels du mémento. N'utilise aucune connaissance extérieure."
+)
+INSTR_PRACTICE = INSTR_QCM + " Tu construis un quiz d'entraînement adaptatif qui couvre chaque cible d'évaluation fournie et retravaille les erreurs signalées."
+INSTR_LESSON = (
+    "Tu es formateur de sapeurs-pompiers. Tu rédiges une micro-leçon en français sur une seule notion du mémento GOC, à partir du seul extrait fourni. "
+    "Précis, concret, sans bavardage. Conserve les libellés, couleurs, formes et abréviations officiels exactement. N'invente aucune règle. "
+    "Texte brut dans chaque champ : pas de Markdown (ni gras, ni titres), pas d'identifiant technique (g_k2, KC) dans le titre."
+)
+INSTR_TARGETS = "Tu extrais des cibles d'évaluation précises et testables à partir d'un extrait de doctrine, en français."
+INSTR_FEEDBACK = (
+    "Tu es formateur de sapeurs-pompiers, bienveillant et précis. Tu expliques des erreurs de quiz en français à partir du mémento, "
+    "sans jamais exposer d'étiquette interne, et tu formules des indices qui guident sans donner la réponse."
+)
+INSTR_QA = (
+    "Tu es formateur de sapeurs-pompiers. Tu réponds en français aux questions sur le mémento GOC (outils graphiques), uniquement d'après les extraits fournis, "
+    "en citant les pages. Concis, pédagogique, sans invention, mise en forme sobre (pas de titres, gras limité aux termes officiels)."
+)
+INSTR_VISUAL = (
+    "Tu es tuteur visuel pour les symboles de cartographie opérationnelle des sapeurs-pompiers. Tu réponds en français, "
+    "tu décris ce que tu vois puis tu relies chaque élément visible (forme, couleur, contour, état, texte) à sa signification dans le mémento fourni."
+)

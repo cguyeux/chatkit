@@ -21,14 +21,16 @@ RUN pip install --no-cache-dir -r requirements.txt
 # App package (includes bundled data: kc_graph1.json, the doctrine PDF served at /static, widgets).
 COPY app /app/app
 
-# Precompute the OCR'd doctrine index at BUILD time (baked into the image as
-# doctrine_chunks.json), not lazily on a user's first request: 140 mvCPU on
-# Scaleway is far too little to OCR 24 pages within a request's lifetime --
-# see app/local_search.py and app/build_doctrine_index.py.
+# Precompute at BUILD time what 140 mvCPU cannot do at request time: the OCR'd
+# doctrine index (doctrine_chunks.json) and the page images (pages/*.png) --
+# see app/local_search.py, app/content.py and app/build_doctrine_index.py.
+# doctrine_pages.json (vision transcription, trainer-reviewed) is committed
+# with the sources, never regenerated here.
 RUN cd /app/app && python build_doctrine_index.py
 
 ENV PYTHONUNBUFFERED=1 \
-    PORT=8080
+    PORT=8080 \
+    OPENAI_AGENTS_DISABLE_TRACING=1
 
 EXPOSE 8080
 CMD ["sh", "-c", "uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8080}"]

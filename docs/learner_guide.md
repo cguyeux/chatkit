@@ -1,142 +1,35 @@
-# Learner Guide
+# Guide apprenant
 
-## What This System Does
+## Ce que fait l'outil
 
-This system helps you learn from PDF course material using an Intelligent Tutoring System workflow.
+Un tuteur pour réviser le mémento gestion opérationnelle et commandement (outils graphiques) :
 
-It can:
+- un diagnostic rapide sur tout le mémento situe votre niveau ;
+- chaque notion est enseignée par une leçon courte avec la page du mémento, puis validée par un quiz ;
+- chaque chapitre se termine par un contrôle ;
+- chaque quiz est corrigé question par question, avec des indices en cas d'erreur ;
+- vous pouvez poser une question libre à tout moment, ou envoyer la photo d'un symbole ;
+- votre progression est conservée d'une visite à l'autre sur le même navigateur.
 
-- estimate your level with a diagnostic QCM
-- teach one knowledge component with a micro-lesson
-- answer questions during the lesson
-- generate adaptive practice QCMs
-- explain mistakes and give hints
-- track mastery and progress
-- answer questions about uploaded symbol images
+## Déroulé
 
-## How To Start
+1. Cliquez sur « Commencer le diagnostic » (une dizaine de questions, une par notion).
+2. Lisez le corrigé puis la leçon de la première notion à travailler.
+3. « Lancer le quiz » : à 70 % de bonnes réponses, la notion est validée.
+4. En cas d'échec : corrigé, « Un indice », « Revoir la leçon », « Refaire le quiz ».
+5. « Notion suivante » après validation ; contrôle du chapitre à la fin de chaque chapitre.
+6. « Ma progression » à tout moment.
 
-Type:
+## Commandes texte équivalentes
 
-```text
-start diagnostic
-```
+`commencer le diagnostic`, `quiz`, `indice`, `notion suivante`, `revoir la leçon`, `ma progression`, `aide`, `oublier la photo`, `recommencer à zéro`. Les réponses d'un quiz peuvent aussi être tapées : `1A 2C 3B 4D`.
 
-The diagnostic estimates your level across several KCs. It does not validate mastery. Mastery is validated later through practice QCMs.
+## Signaler une question
 
-## Learning Workflow
+Chaque question du corrigé a un bouton « Signaler cette question » : le signalement est transmis aux formateurs.
 
-1. Type `start diagnostic`.
-2. Answer the diagnostic QCM.
-3. Read the micro-lesson for the selected KC.
-4. Ask a question if something is unclear.
-5. Type `practice`.
-6. Answer the adaptive practice QCM.
-7. If you make mistakes, read the feedback and type `hint` for progressive help.
-8. Type `practice` again to retry.
-9. When the KC is validated, type `next`.
-10. Type `radar` to see your progress.
+## Points importants
 
-## Commands
-
-- `start diagnostic`: start the global diagnostic QCM.
-- `practice`: generate an adaptive QCM for the current KC.
-- `hint`: get the next hint after mistakes.
-- `next`: move to the next KC after validating the current one.
-- `radar`: show progress by KC and module.
-- `help`: show the in-chat guide.
-- `aide`: show the in-chat guide.
-- `clear image`: forget the active uploaded image.
-
-## Answering QCMs
-
-You can answer in the QCM widget, or type answers in chat like this:
-
-```text
-1A 2C 3B 4D
-```
-
-The system scores your answers and decides the next tutoring action.
-
-If your score is high enough, the KC is validated.
-
-If your score is too low, the system may:
-
-- explain your mistakes
-- detect misconceptions
-- give hints
-- generate a remediation micro-lesson
-- ask you to retry practice
-
-## Asking Lesson Questions
-
-During a micro-lesson, you can ask clarification questions.
-
-Example:
-
-```text
-Why is blue related to water?
-```
-
-For normal text questions, the system answers using the current KC and previous KCs only. This keeps the learning sequence controlled.
-
-## Uploading Symbol Images
-
-You can upload an image of a symbol and ask:
-
-```text
-What does this symbol mean?
-```
-
-The visual agent analyzes the image using the PDF course content.
-
-It can explain visible elements such as:
-
-- form
-- color
-- contour
-- text
-- pictogram
-
-If the image contains several important elements, it explains each one and then gives a combined interpretation.
-
-## Follow-Up Questions About The Same Image
-
-After uploading an image, you can ask follow-up questions without uploading it again.
-
-Examples:
-
-```text
-What about the color?
-What about the form?
-Why is it orange?
-```
-
-The system reuses the same image and recent visual question context.
-
-To forget the current image, type:
-
-```text
-clear image
-```
-
-## Progress Tracking
-
-Type:
-
-```text
-radar
-```
-
-The system shows your progress by KC and module.
-
-The radar is based on mastery evidence from practice and checkpoints, not only from the diagnostic.
-
-## Important Notes
-
-- The diagnostic is only a level estimate.
-- Practice QCMs are used to validate KC mastery.
-- You must validate the current KC before moving to the next KC.
-- Some module checkpoints may appear before continuing.
-- If a question is outside the course scope, the system may refuse or redirect.
-- If an uploaded image is unclear, the system may ask for a clearer image.
+- Le diagnostic estime, les quiz valident.
+- La notion en cours doit être validée avant la suivante ; le contrôle de chapitre doit être réussi avant le chapitre suivant.
+- Les réponses aux questions libres s'appuient uniquement sur le mémento et citent les pages.

@@ -45,6 +45,12 @@ __pycache__/
 # Runtime data
 server/app/uploads/
 server/app/evidence_log.jsonl
+server/app/pages/
+server/app/doctrine_chunks.json
+server/app/data/
+server/app/pages/
+server/app/doctrine_chunks.json
+server/app/data/
 
 # vercel
 .vercel

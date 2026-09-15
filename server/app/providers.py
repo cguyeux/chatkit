@@ -1,133 +1,281 @@
 # app/providers.py
-"""Model-provider selection: lets each chat session pick Mistral (default,
-free tier) or OpenAI/GPT-4.1, with an optional per-session personal API key
-when the shared quota runs out. See cahier_de_labo.md 2026-09-15 for the
-rationale (local demonstrator for trainers, not a public production service)."""
+"""Model-provider selection (Mistral by default, OpenAI on request, optional
+personal key per session) and the ONE way every generator talks to a model:
+`run_structured()`, which asks for a typed (Pydantic) output, retries on
+rate limits and falls back to lenient text parsing.
 
+History (cahier de labo 2026-09-15): the generators used to be free-text
+JSON parsed with json.loads(); Mistral wrapped it in code fences or returned
+an empty tool-calling turn, OpenAI had no credit left, and every generation
+went through a slow file_search tool loop. Grounding is now injected in the
+prompt (see content.py), so the Mistral path needs no tool at all."""
 from __future__ import annotations
 
+import asyncio
+import json
 import os
 import re
 from contextvars import ContextVar
 from dataclasses import dataclass
-from typing import Any, List, Optional
+from typing import Any, List, Optional, Type, TypeVar
 
-from agents import AsyncOpenAI, FileSearchTool, ModelSettings, OpenAIResponsesModel
-
-from app.local_search import build_local_search_tool
+from agents import Agent, AgentOutputSchema, AsyncOpenAI, FileSearchTool, ModelSettings, OpenAIResponsesModel, Runner
+from pydantic import BaseModel, ValidationError
 
 PROVIDER_MISTRAL = "mistral"
 PROVIDER_OPENAI = "openai"
-DEFAULT_PROVIDER = PROVIDER_MISTRAL
+DEFAULT_PROVIDER = os.getenv("DEFAULT_PROVIDER", PROVIDER_MISTRAL)
 KNOWN_PROVIDERS = (PROVIDER_MISTRAL, PROVIDER_OPENAI)
 
 VECTOR_STORE_ID = os.getenv("VECTOR_STORE_ID", "vs_6a116b3869e08191aa26f247b322a8c1")
 MISTRAL_API_KEY = os.getenv("MISTRAL_API_KEY", "")
 MISTRAL_MODEL = os.getenv("MISTRAL_MODEL", "mistral/mistral-large-latest")
-MISTRAL_VISION_MODEL = os.getenv("MISTRAL_VISION_MODEL", "mistral/pixtral-large-latest")
+# pixtral-large-latest was retired: "Invalid model" on 2026-09-15; mistral-large
+# now carries the vision capability itself (checked on /v1/models).
+MISTRAL_VISION_MODEL = os.getenv("MISTRAL_VISION_MODEL", "mistral/mistral-large-latest")
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1")
+OPENAI_VISION_MODEL = os.getenv("OPENAI_VISION_MODEL", "gpt-4.1")
+LLM_MAX_RETRIES = int(os.getenv("LLM_MAX_RETRIES", "3"))
+# Free Mistral tier: ~1 request/second. Parallel generation is throttled here.
+LLM_CONCURRENCY = int(os.getenv("LLM_CONCURRENCY", "2"))
+
+T = TypeVar("T", bound=BaseModel)
 
 
 @dataclass
 class ProviderChoice:
     provider: str = DEFAULT_PROVIDER
-    api_key: Optional[str] = None  # user-supplied override; never logged, never persisted to disk
+    api_key: Optional[str] = None  # user-supplied override; never logged, never persisted
 
 
 current_provider: ContextVar[ProviderChoice] = ContextVar("current_provider", default=ProviderChoice())
+_semaphore: Optional[asyncio.Semaphore] = None
+
+
+def _sem() -> asyncio.Semaphore:
+    global _semaphore
+    if _semaphore is None:
+        _semaphore = asyncio.Semaphore(max(1, LLM_CONCURRENCY))
+    return _semaphore
+
+
+def set_provider_from_context(request_context: Any) -> ProviderChoice:
+    request_context = request_context or {}
+    provider = request_context.get("provider")
+    choice = ProviderChoice(
+        provider=provider if provider in KNOWN_PROVIDERS else DEFAULT_PROVIDER,
+        api_key=request_context.get("api_key") or None,
+    )
+    current_provider.set(choice)
+    return choice
+
+
+def provider_label(choice: Optional[ProviderChoice] = None) -> str:
+    choice = choice or current_provider.get()
+    return "Mistral" if choice.provider == PROVIDER_MISTRAL else "OpenAI"
 
 
 def uses_shared_openai_key(choice: ProviderChoice) -> bool:
-    """True only for the default OpenAI path with no personal key: the only
-    case where the shared, org-private vector store (FileSearchTool) is
-    reachable. A trainer's own key (OpenAI or Mistral) has no access to it."""
     return choice.provider == PROVIDER_OPENAI and not choice.api_key
 
 
-def build_model(choice: ProviderChoice, *, openai_model: str = "gpt-4.1", vision: bool = False) -> Any:
+def build_model(choice: ProviderChoice, *, vision: bool = False) -> Any:
     if choice.provider == PROVIDER_OPENAI:
+        name = OPENAI_VISION_MODEL if vision else OPENAI_MODEL
         if choice.api_key:
-            client = AsyncOpenAI(api_key=choice.api_key)
-            return OpenAIResponsesModel(model=openai_model, openai_client=client)
-        # Bare model name -> SDK default client, i.e. the shared OPENAI_API_KEY
-        # env secret. Unchanged from the pre-multi-provider behaviour.
-        return openai_model
+            return OpenAIResponsesModel(model=name, openai_client=AsyncOpenAI(api_key=choice.api_key))
+        return name
     model_name = MISTRAL_VISION_MODEL if vision else MISTRAL_MODEL
-    key = choice.api_key or MISTRAL_API_KEY
     from agents.extensions.models.litellm_model import LitellmModel
-    return LitellmModel(model=model_name, api_key=key)
+
+    return LitellmModel(model=model_name, api_key=choice.api_key or MISTRAL_API_KEY)
 
 
-def build_tools(choice: ProviderChoice, *, max_results: int = 8) -> List[Any]:
+def build_tools(choice: ProviderChoice, *, max_results: int = 6) -> List[Any]:
+    """Only the shared-OpenAI path still gets the hosted file_search over the
+    private vector store; every other path is grounded by prompt injection."""
     if uses_shared_openai_key(choice):
         return [FileSearchTool(max_num_results=max_results, vector_store_ids=[VECTOR_STORE_ID])]
-    return [build_local_search_tool(max_results=max_results)]
+    return []
 
 
 def build_model_settings(choice: ProviderChoice) -> ModelSettings:
     if choice.provider == PROVIDER_OPENAI:
-        return ModelSettings(store=True)
+        return ModelSettings(store=False)
     return ModelSettings()
 
 
+def make_agent(
+    name: str,
+    instructions: str,
+    *,
+    output_type: Optional[Type[BaseModel]] = None,
+    vision: bool = False,
+    with_tools: bool = False,
+) -> Agent[Any]:
+    choice = current_provider.get()
+    kwargs: dict = {}
+    if output_type is not None:
+        # non-strict: LiteLLM/Mistral reject some strict-schema constraints
+        kwargs["output_type"] = AgentOutputSchema(output_type, strict_json_schema=False)
+    return Agent[Any](
+        name=name,
+        model=build_model(choice, vision=vision),
+        tools=build_tools(choice) if with_tools else [],
+        instructions=instructions,
+        model_settings=build_model_settings(choice),
+        **kwargs,
+    )
+
+
 _CODE_FENCE_RE = re.compile(r"```(?:json)?\s*\n?(.*?)\n?```", re.DOTALL)
+_RATE_HINTS = ("429", "rate limit", "rate_limit", "capacity", "overloaded", "503", "timeout", "timed out")
 
 
 def strip_code_fence(text: str) -> str:
-    """Every prompt in this file says "Return ONLY JSON" / "no markdown code
-    fences", but Mistral (unlike GPT-4.1 with the same instructions, both
-    tested live 2026-09-15) still sometimes wraps its answer in a ```json
-    ... ``` block, which breaks every json.loads() call site outright
-    (JSONDecodeError: Expecting value at char 0). `search` (not `match`) on
-    purpose: a stray preamble before the fence ("Voici les questions :")
-    must not defeat the extraction. Strip it defensively rather than
-    trusting the instruction."""
-    match = _CODE_FENCE_RE.search(text)
-    return match.group(1).strip() if match else text.strip()
+    match = _CODE_FENCE_RE.search(text or "")
+    return match.group(1).strip() if match else (text or "").strip()
 
 
-def _looks_like_json(text: str) -> bool:
-    return text[:1] in ("[", "{")
+def _extract_json_object(text: str) -> str:
+    raw = strip_code_fence(text)
+    starts = [i for i in (raw.find("{"), raw.find("[")) if i >= 0]
+    if not starts:
+        return raw
+    start = min(starts)
+    end = max(raw.rfind("}"), raw.rfind("]"))
+    return raw[start : end + 1] if end > start else raw
 
 
-async def run_agent_text(agent: Any, prompt: Any, ctx: Any, *, retries: int = 2, expect_json: bool = True) -> str:
-    """Runner.run wrapper: strips an accidental markdown code fence from the
-    output (see strip_code_fence) and retries on a blank or non-JSON-looking
-    final_output, reproduced live on the free Mistral tier (a tool-calling
-    turn ending with an empty response, no exception). Bounded on purpose: a
-    mitigation for an observed flake, not a general-purpose resilience loop.
-    Pass expect_json=False for a plain-text caller that shouldn't reject a
-    normal blank/short response as a retry trigger."""
-    from agents import Runner
+def _example_for(model_cls: Any) -> Any:
+    """Placeholder instance of a Pydantic model, used as the shape hint in
+    the text fallback ("summary": "...", "hints": ["...", "..."])."""
+    import typing
 
-    raw = ""
-    for _ in range(retries + 1):
-        res = await Runner.run(agent, prompt, context=ctx)
-        raw = strip_code_fence((res.final_output or "").strip())
-        if raw and (not expect_json or _looks_like_json(raw)):
-            return raw
-    return raw
+    def for_annotation(ann: Any) -> Any:
+        origin = typing.get_origin(ann)
+        args = typing.get_args(ann)
+        if origin is typing.Union or str(origin) == "types.UnionType":
+            non_none = [a for a in args if a is not type(None)]
+            return for_annotation(non_none[0]) if non_none else None
+        if origin in (list, typing.List):
+            return [for_annotation(args[0])] if args else ["..."]
+        if origin in (dict, typing.Dict):
+            return {}
+        if isinstance(ann, type) and issubclass(ann, BaseModel):
+            return _example_for(ann)
+        if ann is int:
+            return 1
+        if ann is float:
+            return 0.5
+        if ann is bool:
+            return True
+        return "..."
+
+    return {name: for_annotation(f.annotation) for name, f in model_cls.model_fields.items()}
 
 
-_QUOTA_ERROR_HINTS = ("rate limit", "quota", "429", "insufficient_quota", "capacity")
+def is_rate_limit(exc: Exception) -> bool:
+    text = str(exc).lower()
+    return any(h in text for h in _RATE_HINTS) and "credit" not in text
+
+
+async def _run_with_retry(agent: Agent[Any], prompt: Any, ctx: Any) -> Any:
+    delay = 2.0
+    last: Optional[Exception] = None
+    for attempt in range(LLM_MAX_RETRIES + 1):
+        try:
+            async with _sem():
+                return await Runner.run(agent, prompt, context=ctx, max_turns=4)
+        except Exception as exc:  # noqa: BLE001
+            last = exc
+            if attempt >= LLM_MAX_RETRIES or not is_rate_limit(exc):
+                raise
+            await asyncio.sleep(delay)
+            delay = min(delay * 2, 12.0)
+    assert last is not None
+    raise last
+
+
+async def run_structured(
+    name: str,
+    instructions: str,
+    prompt: Any,
+    model_cls: Type[T],
+    ctx: Any = None,
+    *,
+    vision: bool = False,
+    with_tools: bool = False,
+) -> T:
+    """Typed generation. First with the SDK's structured output; if the
+    provider refuses the schema or returns something unparsable, one plain
+    text pass with lenient JSON extraction + Pydantic validation."""
+    try:
+        agent = make_agent(name, instructions, output_type=model_cls, vision=vision, with_tools=with_tools)
+        res = await _run_with_retry(agent, prompt, ctx)
+        out = res.final_output
+        if isinstance(out, model_cls):
+            return out
+        if isinstance(out, BaseModel):
+            return model_cls.model_validate(out.model_dump())
+        if isinstance(out, (dict, list)):
+            return model_cls.model_validate(out)
+        if isinstance(out, str) and out.strip():
+            return model_cls.model_validate_json(_extract_json_object(out))
+        raise ValueError("empty structured output")
+    except Exception as first_exc:  # noqa: BLE001
+        if is_rate_limit(first_exc) or "credit" in str(first_exc).lower() or "401" in str(first_exc):
+            raise
+        print(f"[{name}] structured output failed ({type(first_exc).__name__}: {str(first_exc)[:160]}), text fallback")
+    # An EXAMPLE object, not the JSON schema: given the schema, Mistral echoed
+    # the schema itself ({"properties": {...}}) instead of an instance
+    # (smoke test 2026-09-15).
+    text_instructions = (
+        instructions
+        + "\nRéponds UNIQUEMENT par un objet JSON valide ayant exactement cette forme (remplace les valeurs), sans texte autour ni bloc de code :\n"
+        + json.dumps(_example_for(model_cls), ensure_ascii=False)
+    )
+    agent = make_agent(name, text_instructions, vision=vision, with_tools=with_tools)
+    last_err: Optional[Exception] = None
+    for _ in range(2):
+        res = await _run_with_retry(agent, prompt, ctx)
+        raw = _extract_json_object(str(res.final_output or ""))
+        if not raw:
+            last_err = ValueError("empty output")
+            continue
+        try:
+            return model_cls.model_validate_json(raw)
+        except ValidationError as exc:
+            last_err = exc
+    raise RuntimeError(f"{name}: sortie du modèle inexploitable ({last_err})")
+
+
+async def run_text(name: str, instructions: str, prompt: Any, ctx: Any = None, *, vision: bool = False, with_tools: bool = False) -> str:
+    agent = make_agent(name, instructions, vision=vision, with_tools=with_tools)
+    res = await _run_with_retry(agent, prompt, ctx)
+    return str(res.final_output or "").strip()
+
+
+_QUOTA_ERROR_HINTS = ("rate limit", "rate_limit", "quota", "429", "insufficient_quota", "capacity", "credit")
 _AUTH_ERROR_HINTS = ("401", "unauthorized", "invalid api key", "authentication")
 
 
 def friendly_llm_error(exc: Exception) -> str:
-    """Turns a raw provider exception into a message a trainer can act on,
-    instead of a bare stack-trace fragment. Never includes the api_key
-    (the SDK's own exception messages don't echo it back)."""
     text = str(exc).lower()
-    choice = current_provider.get()
-    provider_label = "Mistral" if choice.provider == PROVIDER_MISTRAL else "OpenAI/GPT-4.1"
+    label = provider_label()
+    if "credit" in text or "insufficient_quota" in text:
+        return (
+            f"Le crédit {label} partagé est épuisé. "
+            "Ouvrez les réglages (icône engrenage) pour utiliser votre propre clé, ou changez de modèle."
+        )
     if any(hint in text for hint in _QUOTA_ERROR_HINTS):
         return (
-            f"⚠️ Quota {provider_label} dépassé pour le moment. "
-            "Ouvre les réglages (icône engrenage) pour ajouter ta propre clé API, "
-            "ou réessaie plus tard."
+            f"Le service {label} est saturé pour le moment (limite de requêtes). "
+            "Réessayez dans une minute, ou ajoutez votre propre clé dans les réglages."
         )
     if any(hint in text for hint in _AUTH_ERROR_HINTS):
         return (
-            f"⚠️ Clé API {provider_label} refusée. "
-            "Vérifie la clé collée dans les réglages, ou retire-la pour revenir à la clé partagée."
+            f"La clé {label} a été refusée. "
+            "Vérifiez la clé collée dans les réglages, ou retirez-la pour revenir à la clé partagée."
         )
-    return f"⚠️ Erreur interne ({provider_label}) : {exc}"
+    return f"Une erreur est survenue côté {label} : {str(exc)[:200]}"
