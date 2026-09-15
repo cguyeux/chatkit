@@ -430,3 +430,35 @@ technique, laissé à l'utilisateur). Logs Scaleway (`print()` ajoutés)
 non consultés faute d'accès CLI aux logs de conteneurs — seule la
 console Scaleway les montrerait ; non nécessaire, la reproduction a
 validé le correctif directement par son résultat fonctionnel.
+
+---
+
+## 2026-09-15 11h12 — Procédure de déploiement Scaleway envoyée à Helmi Baazaoui
+
+Helmi Baazaoui (doctorant de CG, auteur amont du dépôt
+`github.com/helmi1105/chatkit`) a reçu par mail la procédure de
+déploiement Scaleway de ce projet (commandes `docker build`/`tag`/`push`
++ `scw container container update` pour les deux conteneurs `api` et
+`web`, génération du domainKey ChatKit côté organisation OpenAI, et les
+trois pièges déjà consignés dans `DEPLOY_SCALEWAY.md`), pour qu'il
+puisse déployer sa propre instance sur son propre compte Scaleway. Pas
+de pièce jointe (le fichier `DEPLOY_SCALEWAY.md` n'a pas été transmis
+tel quel : ses identifiants de ressources — namespace, IDs de
+conteneurs, domainKey — sont propres au compte Scaleway/OpenAI de CG et
+inutilisables par Helmi ; la procédure a été retapée avec des
+espaces réservés `<ton-namespace>`, `<container-id>`, `<ta-clé>`).
+Registre tutoiement, conforme aux échanges habituels avec lui
+(vérifié sur l'historique de mail avant rédaction).
+
+**Incident d'outillage rencontré et contourné, pas encore documenté
+dans le projet lui-même (versé à la KB inter-projets, cf.
+`~/.agents/knowledge/superhuman-mcp.md`).** Le composeur de brouillon
+Superhuman (`create_or_update_draft`, paramètre `body`) supprime
+silencieusement l'espace précédant tout `.` ou `:`, y compris à
+l'intérieur d'un bloc `<pre>` de code : la commande
+`docker build ... -t chatkit-api:latest .` en est ressortie
+`chatkit-api:latest.`, contexte de build perdu, commande cassée. Même
+résultat avec `./` à la place de `.`. Contournement : remplacer le `.`
+de contexte par `$PWD` (équivalent fonctionnel, insensible à la
+réécriture), détecté en relisant le `body` renvoyé par le serveur
+avant `send_draft`, pas celui envoyé.
