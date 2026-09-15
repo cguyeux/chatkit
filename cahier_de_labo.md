@@ -752,3 +752,83 @@ questions les plus ratées, code d'accès et quota.
 **Décision attendue.** Choix par CG des axes à lancer ; rien n'est
 engagé. Aucune piste n'est validée par un test, ce sont des lectures de
 code.
+
+---
+
+## 2026-09-15 18h40 — Refonte du tuteur sur les quatre axes, déployée en v11 et vérifiée en direct
+
+**Décision de CG.** Les quatre axes de l'audit du jour retenus ensemble
+(fiabilité et vitesse, vitrine stagiaire, pédagogie, outillage formateur).
+
+**Fait, backend (`server/app/`).** Réécriture de `orchestrator.py`
+(1 100 lignes contre 2 982), nouveaux modules `schemas.py` (sorties
+Pydantic, résolution de la clé de réponse contre les propositions, mélange
+des choix, questions inexploitables écartées), `content.py` (ancrage par
+injection du texte des pages), `storage.py` (bucket S3 avec repli local),
+`bank.py` (banque validée servie sans LLM), `widgets/its_widgets.py`
+(boutons d'action serveur `its.command`, corrigé avec « Signaler cette
+question », fiche source avec image de page, carte de progression),
+`providers.py` (une seule voie `run_structured` : sortie typée du SDK,
+reprise avec backoff sur 429, repli texte lenient), `chatkit_server.py`
+(rendu par blocs, `ProgressUpdateEvent` pendant les générations,
+`add_feedback` journalisé), `main.py` (`/health`, `/progress`, code d'accès
+optionnel `ACCESS_CODE`, CORS restreint), `data_store.py` (fils ChatKit
+persistés, `TypeAdapter(ThreadItem)` vérifié en aller-retour). Diagnostic
+sur tout le mémento (tirage par chapitre, une question par notion,
+génération parallèle bornée à 2), file des notions faibles, leçon de
+reprise seulement sous 50 %, indices générés à partir des erreurs réelles,
+questions libres acceptées à tout moment, français partout.
+
+**Fait, contenu.** `transcribe_pages.py` : transcription structurée des 24
+pages par `mistral-large-latest` (vision) en `doctrine_pages.json`, 246
+symboles et 105 règles ; la page 3 retrouve ses six formes avec leur sens et
+la page 4 ses couleurs, que l'OCR perdait. Une règle hallucinée corrigée à la
+main (« forme, couleur, taille, orientation » -> forme, couleur, état,
+surcharge) ; **relecture complète par les formateurs à faire**, le fichier
+est la vérité servie au tuteur. Images de page rendues au build (110 dpi).
+
+**Fait, front (fork).** Accueil et visite guidée en français (mémorisée),
+barre de progression alimentée par `/progress`, porte de code d'accès,
+erreurs non bloquantes, volet droit empilé sur mobile, thème clair par
+défaut, bouton « Recommencer à zéro ». `tsc` et `next build` propres.
+
+**Fait, outillage formateur.** `generate_bank.py` (candidats vers xlsx à
+relire), `import_bank.py` (lignes « validé » vers `question_bank.json` ou la
+clé `bank/questions.json` du bucket, sans rebuild), `trainer_report.py`,
+`eval_generation.py`, `smoke_its.py`. Aucun n'a encore été lancé en vrai
+hors `smoke_its.py`.
+
+**Infra.** Bucket `chatkit-formation-state` (fr-par), application IAM
+`chatkit-api-storage` + politique ObjectStorageFullAccess + clé expirant le
+2027-09-15 (`~/.config/chatkit/scw_storage.env`). Images `api:v11`,
+`web:v11` déployées ; `v10` conservée pour retour arrière. `ACCESS_CODE`
+non posé (le site reste ouvert tant que CG n'a pas choisi un code).
+
+**Mesures.** Test de fumée dans l'image (Mistral) : diagnostic 10 questions
+en 17 à 29 s (contre ~3 min avant), soumission + leçon 9-10 s, quiz 16-18 s,
+échec + feedback + leçon de reprise 28-50 s, question libre 2-3 s, 16
+générations pour le parcours complet. En production (agent-browser, site
+public) : diagnostic affiché en 30 s à froid, corrigé 4/10 rendu, fiche
+source avec image, bouton « Lancer le quiz » -> quiz en 24 s, barre d'état
+« Notion 2/32 : LA FORME · Chapitre : Définition du langage
+cartographique ». Bucket vérifié : `sessions/`, `threads/`, `events/`,
+`cache/` présents après le test.
+
+**Découvertes.** (1) Le compte OpenAI n'a plus de crédit
+(`credit_balance_exhausted`) : le second choix du sélecteur ne marche
+qu'avec une clé personnelle. (2) `pixtral-large-latest` retiré par
+Mistral ; `mistral-large-latest` porte la vision. (3) Montrer un schéma JSON
+à Mistral lui fait renvoyer le schéma : le repli texte montre un exemple
+d'instance. (4) Le chemin structuré du SDK Agents échoue par intermittence
+sur `Feedback` (« Invalid JSON ») ; le repli texte prend le relais, vu deux
+fois sur deux runs.
+
+**Non fait / réserves.** Relecture humaine de `doctrine_pages.json` ;
+banque de questions vide (0 question validée, tout passe encore par le
+modèle) ; questions visuelles avec image de symbole non implémentées
+(seule l'image de page entière est montrée) ; `eval_generation.py` et
+`generate_bank.py` jamais exécutés ; pas de test du trajet OpenAI (sans
+crédit) ni de l'envoi de photo en production ; le quiz de reprise reformule
+mais reste proche du premier sur une notion aussi courte que LA FORME ;
+CORS restreint aux deux origines connues, à élargir si un autre domaine
+apparaît. Commits `a0a56c8`, `2f66ea8`, `7a5deb0` poussés sur `fork`.
