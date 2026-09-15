@@ -108,6 +108,32 @@ def parse_answers_from_text(text: str) -> Dict[int, str]:
     return out
 
 
+_QCM_ANSWER_LETTER_RE = re.compile(r"[ABCD]")
+
+
+def _coerce_qcm_answer_letter(raw_answer: Any) -> str:
+    text = str(raw_answer or "").strip().upper()
+    if text in ("A", "B", "C", "D"):
+        return text
+    match = _QCM_ANSWER_LETTER_RE.search(text)
+    return match.group(0) if match else "A"
+
+
+def normalize_qcm_answers(questions: List[dict], agent_name: str) -> List[dict]:
+    """Coerce each question's LLM-provided `answer` field into a bare A/B/C/D
+    letter: the generating agents are prompted for this shape but not
+    constrained by a JSON schema, and a free-text or punctuated answer makes
+    every scoring comparison against the widget's hard-coded A/B/C/D values
+    fail silently (cf. cahier de labo 2026-09-15, diagnostic "0 partout")."""
+    for q in questions:
+        raw_answer = q.get("answer")
+        letter = _coerce_qcm_answer_letter(raw_answer)
+        if letter != str(raw_answer or "").strip().upper():
+            print(f"[{agent_name}] non-conforming answer {raw_answer!r} for question {q.get('number')!r} coerced to {letter!r}")
+        q["answer"] = letter
+    return questions
+
+
 def fit_qcm_widget_text(text: Any, max_chars: int) -> str:
     """Keep QCM widget labels compact enough for ChatKit radio/text rendering."""
     clean = re.sub(r"\s+", " ", str(text or "")).strip()
@@ -864,7 +890,7 @@ Return ONLY JSON list:
 """
         res = await Runner.run(self.agent, prompt, context=ctx)
         raw = (res.final_output or "").strip()
-        return json.loads(raw)
+        return normalize_qcm_answers(json.loads(raw), "Diagnostic-QCM")
 
 
 class KcEssentialTargetAgent:
@@ -1041,7 +1067,9 @@ Return ONLY JSON:
 """
         res = await Runner.run(self.agent, prompt, context=ctx)
         raw = (res.final_output or "").strip()
-        return json.loads(raw)
+        parsed = json.loads(raw)
+        normalize_qcm_answers(parsed.get("questions", []), "Practice-QCM")
+        return parsed
 
     async def repair_coverage(
         self,
@@ -1101,7 +1129,9 @@ Return ONLY JSON with the same shape:
 """
         res = await Runner.run(self.agent, prompt, context=ctx)
         raw = (res.final_output or "").strip()
-        return json.loads(raw)
+        parsed = json.loads(raw)
+        normalize_qcm_answers(parsed.get("questions", []), "Practice-QCM-repair")
+        return parsed
 
 
 class ModuleQcmAgent:
@@ -1154,7 +1184,7 @@ Return ONLY JSON list:
 """
         res = await Runner.run(self.agent, prompt, context=ctx)
         raw = (res.final_output or "").strip()
-        return json.loads(raw)
+        return normalize_qcm_answers(json.loads(raw), "Module-QCM")
 
 
 
@@ -2567,6 +2597,7 @@ Details:
         mastery_before = dict(sess.mastery)
 
         weakness_kc_id, overall, per_kc = self.scorer.find_weakness(q_to_kc, answers, correct)
+        print(f"[_process_answers] scope={sess.scope} submitted={dict(answers)} correct={dict(correct)} overall={overall:.2f} per_kc={per_kc}")
 
         # update mastery (EMA)
         # update mastery (EMA) — FIXED (no 30% on first observation)

@@ -277,6 +277,7 @@ class MyChatKitServer(ChatKitServer[dict[str, Any]]):
             )
 
             submitted_answers = self._extract_answers_from_payload(_action.payload)
+            print(f"[qcm.submit] raw_payload={_action.payload!r} extracted_answers={submitted_answers!r}")
             if not submitted_answers:
                 evaluation_text = "⚠️ No answers received with the submission."
                 message_item = AssistantMessageItem(

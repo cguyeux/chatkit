@@ -290,3 +290,102 @@ test, comme à chaque déploiement précédent de ce projet.
 
 **Dette documentaire corrigée.** `DEPLOY_SCALEWAY.md` : images `api`
 `:v5` -> `:v6`, `web` `:v7` -> `:v8`.
+
+---
+
+## 2026-09-15 10h29 — Signalement Yvon Stortz : diagnostic « 0 partout », investigation statique
+
+**Signalement (Slack, DM Christophe Guyeux <-> Yvon Stortz, 2026-09-14
+18h47-18h53).** Après avoir reçu le mail annonçant le « Démonstrateur
+formateur intelligent : cartographie opérationnelle (version alpha) »,
+Yvon teste sur téléphone. Verbatim : « OK. j'ai tout rempli et j'ai 0
+partout » puis « du coup il m'explique les principes de base. alors que
+j'avais tout coché. Première approche : je ne comprends pas bien 🙂 ».
+Aucune URL, capture ni message d'erreur technique fournis ; fil resté
+sans réponse.
+
+**Vérification infra.** Site public `HTTP 200` (curl direct, 2026-09-15).
+Conteneurs Scaleway `api` (`:v6`) et `web` (`:v8`) tous deux `ready`. Le
+signalement n'est donc pas une panne d'infrastructure.
+
+**Analyse statique du code (pas de reproduction en direct : aurait
+déclenché un appel OpenAI facturé, décision prise de ne pas le faire sans
+validation préalable).** Le symptôme (« 0 partout » sur un QCM diagnostic
+de 8 questions rempli en entier, puis micro-leçon de base comme si rien
+n'était su) correspond exactement au chemin `_process_answers` avec
+`sess.scope == "diagnostic"` (`orchestrator.py:2561`) quand
+`ScoreFindWeaknessAgent.find_weakness` (`orchestrator.py:1579`) ne trouve
+AUCUNE réponse correcte : chaque comparaison `u == correct.upper()`
+échoue systématiquement. Deux hypothèses distinctes identifiées, non
+départagées faute de test en direct :
+
+1. **Format de la clé LLM `answer`.** `DiagnosticQcmAgent.generate()`
+   (`orchestrator.py:814`) demande au modèle (gpt-4.1, prompt libre, PAS
+   de schéma de sortie strict / `response_format`) de renvoyer
+   `"answer":"A/B/C/D"` par question, valeur ensuite prise telle quelle
+   comme vérité terrain (`hidden[num] = str(q["answer"]).upper().strip()`,
+   ligne 2291) sans validation. Le widget, lui, encode toujours ses
+   options en dur `"A"/"B"/"C"/"D"` (`qcm_widget_data`, ligne 126) quel
+   que soit ce que le modèle a mis dans `answer`. Si le modèle s'écarte du
+   format demandé pour une partie ou la totalité des questions (texte
+   complet, ponctuation, etc.), la comparaison échoue pour ces
+   questions — potentiellement toutes si le modèle a divergé de façon
+   systématique sur ce run précis.
+2. **Extraction du payload du widget.** `_extract_answers_from_payload`
+   (`chatkit_server.py:362`) gère deux formes de payload possibles
+   (`values.answers` dict imbriqué, ou clés plates `answers.N`) sans
+   qu'aucun test en conditions réelles n'ait jamais validé laquelle le
+   SDK ChatKit produit réellement en production (cahier du 2026-09-14 :
+   « Pas de test du clic réel sur le CTA final », partout où un appel
+   OpenAI réel aurait été facturé). Un troisième format non couvert
+   ferait échouer `int(str(key))` silencieusement (clé ignorée), donnant
+   `user_answers` vide et donc 0 partout — correspondance exacte avec le
+   symptôme.
+
+**Risque architectural distinct, noté mais pas la cause la plus probable
+du symptôme précis.** `Orchestrator._sessions` (ligne 1722) et
+`MyDataStore` (`data_store.py:45`, commentaire du fichier : « Simple
+in-memory store ») sont 100 % en mémoire process, sans aucune
+persistance externe. Les conteneurs Scaleway sont `scale-to-zero`
+(`min_scale=0`, timeout 5 min pour `api`). Une session perdue par
+redémarrage à froid produirait normalement le message dédié « ⚠️ No
+active QCM. Type: start diagnostic » (ligne 2563), pas un score de 0
+partout suivi d'une micro-leçon — donc ne colle pas exactement au
+signalement d'Yvon, mais reste une fragilité réelle pour tout usage
+multi-utilisateurs ou étalé dans le temps (diagnostic + tour guidé
+dépassant 5 minutes).
+
+**Non fait.** Aucune reproduction en direct (coût OpenAI), aucun
+correctif appliqué, aucun redéploiement. Décision de la suite renvoyée à
+l'utilisateur (reproduction en direct vs instrumentation par logs vs
+correctif défensif sur les deux hypothèses avant tout nouveau test
+utilisateur).
+
+**Décision utilisateur (sondage).** Corriger puis reproduire (option
+recommandée retenue) : verrouiller le format de réponse LLM, instrumenter
+par logs, redéployer, puis un seul run réel pour valider.
+
+**Correctif hypothèse 1 (`orchestrator.py`).** Nouvelle fonction
+`normalize_qcm_answers()` : coerce le champ `answer` de chaque question
+générée par LLM en une lettre nue A/B/C/D (extraction par regex si le
+modèle a répondu autre chose que la lettre seule, `"A"` par défaut en
+dernier recours, avec `print()` d'avertissement à chaque coercition
+effective). Appliquée aux quatre points de génération JSON qui partagent
+le même défaut : `DiagnosticQcmAgent.generate()`,
+`PracticeQcmAgent.generate_adaptive()`, `PracticeQcmAgent.repair_coverage()`,
+`ModuleQcmAgent.generate()` — pas seulement le diagnostic signalé, les
+trois QCM partagent le même prompt libre sans schéma de sortie strict et
+la prochaine étape du même parcours (pratique) aurait reproduit le bug
+à l'identique.
+
+**Instrumentation (hypothèse 2, `chatkit_server.py` et `orchestrator.py`).**
+`print()` du payload brut de `qcm.submit` et des réponses extraites
+avant le garde `if not submitted_answers`, et `print()` du détail
+soumis/correct/score par KC dans `_process_answers`. Objectif : si le
+correctif de l'hypothèse 1 ne suffit pas, la prochaine soumission réelle
+(logs console Scaleway, pas d'accès CLI `scw` aux logs trouvé) montrera
+directement si l'extraction du payload échoue.
+
+**Validation avant déploiement.** `python3 -m py_compile` propre sur les
+deux fichiers modifiés (venv local `server/.venv` toujours vide/cassé,
+non réparé, hors périmètre — même limite que les sessions précédentes).
